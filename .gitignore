@@ -1,0 +1,21 @@
+# Gradle / Android
+.gradle/
+build/
+local.properties
+.idea/
+*.iml
+.DS_Store
+captures/
+.externalNativeBuild/
+.cxx/
+.kotlin/
+
+# 构建产物
+*.apk
+*.aab
+
+# 第三方编辑器源码副本(assets/ticket_editor/ 内已内置打包所需版本)
+12306-train-ticket-editor-main/
+
+# 本地工具
+.zcodeignore
