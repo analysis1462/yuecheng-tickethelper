@@ -12,8 +12,8 @@ android {
         applicationId = "com.yuecheng.ticket"
         minSdk = 21
         targetSdk = 34
-        versionCode = 4
-        versionName = "1.1.2"
+        versionCode = 5
+        versionName = "1.1.3"
     }
 
     buildTypes {

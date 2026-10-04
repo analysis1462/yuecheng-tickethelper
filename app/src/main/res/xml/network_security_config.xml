@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- 支付网关 pay.xintuyun.cn 走明文 HTTP,Android 9+ 默认拒绝(ERR_CLEARTEXT_NOT_PERMITTED),
-     仅对支付网关这一个域放行,其余(含同站其他子域)仍强制 HTTPS -->
+<!-- 支付网关 pay.xintuyun.cn 已实测支持 HTTPS,App 统一把 payUrl 升级为 https 加载;
+     此处明文许可仅作为老网关页内嵌 http 子资源/回跳的兜底,仅限该域,其余全部强制 HTTPS -->
 <network-security-config>
     <domain-config cleartextTrafficPermitted="true">
         <domain includeSubdomains="false">pay.xintuyun.cn</domain>

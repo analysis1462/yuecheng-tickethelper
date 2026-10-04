@@ -38,7 +38,7 @@ import com.yuecheng.ticket.ui.theme.applyWindowBackground
  * 支付容器:加载官方支付网关返回的 payUrl。
  * 拦截 alipay:// / alipays:// / weixin:// 等scheme跳转到原生支付宝/微信完成支付;
  * intent:// 协议按 Chrome 规则解析降级;
- * 顶层导航离开支付网关主机时先弹用户确认(网关为明文 HTTP,防劫持页把用户导去钓鱼站)。
+ * payUrl 统一升级为 HTTPS 加载(网关已实测支持);顶层导航离开网关主机时先弹用户确认,防劫持页导去钓鱼站。
  */
 class PayActivity : ComponentActivity() {
 
@@ -54,7 +54,8 @@ class PayActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         applyWindowBackground(ThemePrefs.dark.value)
-        val url = intent.getStringExtra(EXTRA_URL).orEmpty()
+        // 服务端返回的 payUrl 是 http://,网关已实测支持 HTTPS:统一升级,页面内容走加密通道
+        val url = upgradePayUrl(intent.getStringExtra(EXTRA_URL).orEmpty())
         val scheme = runCatching { Uri.parse(url).scheme?.lowercase() }.getOrNull()
         // 只接受 http(s) 支付地址,拒绝 file:// javascript: 等危险 scheme
         if (scheme != "http" && scheme != "https") { finish(); return }
@@ -117,15 +118,30 @@ class PayActivity : ComponentActivity() {
      * 返回 true 表示已拦截。已知支付 scheme 放行到外部 App,未知 scheme 一律拦截;
      * 顶层导航跳往支付网关以外的站点时先弹用户确认,确认后才加载(子框架不受影响)。
      */
+    /** 网关已支持 HTTPS:把本站 http://pay.xintuyun.cn 统一升级为 https,其余 URL 原样返回 */
+    private fun upgradePayUrl(url: String): String {
+        val u = runCatching { Uri.parse(url) }.getOrNull() ?: return url
+        return if (u.scheme?.lowercase() == "http" && u.host?.lowercase() == "pay.xintuyun.cn")
+            u.buildUpon().scheme("https").toString()
+        else url
+    }
+
     private fun handleUrl(view: WebView, url: String, mainFrame: Boolean): Boolean {
         val uri = Uri.parse(url)
         return when (uri.scheme?.lowercase()) {
             null, "http", "https" -> {
-                if (mainFrame && payHost != null && !uri.host.equals(payHost, ignoreCase = true)) {
-                    pendingCrossSiteUrl = url
-                    true
-                } else {
-                    false // WebView 自己处理
+                when {
+                    mainFrame && payHost != null && !uri.host.equals(payHost, ignoreCase = true) -> {
+                        pendingCrossSiteUrl = url
+                        true
+                    }
+                    // 同站 http 顶层跳转(如网关 302 回 http)也升级为 https,保持全程加密
+                    mainFrame && payHost != null && uri.host.equals(payHost, ignoreCase = true)
+                        && uri.scheme?.lowercase() == "http" -> {
+                        view.loadUrl(upgradePayUrl(url))
+                        true
+                    }
+                    else -> false // WebView 自己处理
                 }
             }
             "alipay", "alipays" -> launchExternal(url)
