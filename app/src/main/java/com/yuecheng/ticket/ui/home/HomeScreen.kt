@@ -1,7 +1,11 @@
 package com.yuecheng.ticket.ui.home
 
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -40,6 +44,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -50,16 +55,25 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.navigation.NavController
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.ui.input.pointer.pointerInput
+import android.widget.Toast
+import kotlinx.coroutines.launch
+import com.yuecheng.ticket.data.FavLines
 import com.yuecheng.ticket.data.FlowState
 import com.yuecheng.ticket.data.IndexInfo
 import com.yuecheng.ticket.data.Repo
+import com.yuecheng.ticket.data.SearchHistory
 import com.yuecheng.ticket.data.Session
+import com.yuecheng.ticket.data.StartCity
+import com.yuecheng.ticket.data.ThemePrefs
+import com.yuecheng.ticket.data.resultOf
 import com.yuecheng.ticket.ui.common.ErrorBox
 import com.yuecheng.ticket.ui.common.LoadingBox
 import com.yuecheng.ticket.ui.common.addDays
 import com.yuecheng.ticket.ui.common.dayDiff
 import com.yuecheng.ticket.ui.common.weekLabel
-import kotlinx.coroutines.launch
+import com.yuecheng.ticket.ui.debug.TestPanelDialog
 
 @Composable
 fun HomeScreen(nav: NavController) {
@@ -67,10 +81,11 @@ fun HomeScreen(nav: NavController) {
     var info by remember { mutableStateOf<IndexInfo?>(null) }
     var loading by remember { mutableStateOf(true) }
     var error by remember { mutableStateOf("") }
+    val uiScope = rememberCoroutineScope()
 
     suspend fun load() {
         loading = true; error = ""
-        runCatching { Repo.index() }
+        resultOf { Repo.index() }
             .onSuccess {
                 info = it
                 FlowState.startIndex = it
@@ -98,11 +113,15 @@ fun HomeScreen(nav: NavController) {
                 Column(Modifier.weight(1f)) {
                     Text("悦程购票", color = Color.White, fontSize = 26.sp, fontWeight = FontWeight.Bold)
                     Spacer(Modifier.height(4.dp))
-                    Text("汽车票查询 · 购票 · 改签 · 退票", color = Color(0xCCFFFFFF), fontSize = 13.sp)
+                    // 副标题:"退票"二字是隐藏测试模式的入口(长按5秒)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("汽车票查询 · 购票 · 改签 · ", color = Color(0xCCFFFFFF), fontSize = 13.sp)
+                        TestModeEntryText()
+                    }
                 }
-                IconButton(onClick = { com.yuecheng.ticket.data.ThemePrefs.toggle() }) {
+                IconButton(onClick = { ThemePrefs.toggle() }) {
                     Icon(
-                        if (com.yuecheng.ticket.data.ThemePrefs.dark.value) Icons.Default.LightMode
+                        if (ThemePrefs.dark.value) Icons.Default.LightMode
                         else Icons.Default.DarkMode,
                         "夜间模式", tint = Color.White,
                     )
@@ -113,55 +132,73 @@ fun HomeScreen(nav: NavController) {
             }
         }
 
-        when {
-            loading -> LoadingBox()
-            error.isNotEmpty() -> ErrorBox(error) { }
-            idx != null -> {
-                Column(
-                    Modifier
-                        .fillMaxSize()
-                        .padding(horizontal = 16.dp),
-                ) {
-                    SearchCard(nav, idx)
-                    Spacer(Modifier.height(16.dp))
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                        EntryCard(
-                            Modifier.weight(1f),
-                            icon = { Icon(Icons.Default.ConfirmationNumber, null, tint = Color(0xFF0B57D0)) },
-                            title = "我的订单",
-                            sub = "支付 / 改签 / 退票",
-                        ) { nav.navigate("orders") }
-                        EntryCard(
-                            Modifier.weight(1f),
-                            icon = {
-                                Icon(Icons.Default.Person, null, tint = Color(0xFF1E8E3E))
-                            },
-                            title = if (Session.isLoggedIn) "已登录" else "未登录",
-                            sub = if (Session.isLoggedIn) Session.displayMobile else "点击登录账号",
-                        ) {
-                            nav.navigate(if (Session.isLoggedIn) "profile" else "login")
+        Box(Modifier.fillMaxWidth().weight(1f)) {
+            when {
+                loading -> LoadingBox()
+                error.isNotEmpty() -> ErrorBox(error) { uiScope.launch { load() } }
+                idx != null -> {
+                    Column(
+                        Modifier
+                            .fillMaxSize()
+                            .padding(horizontal = 16.dp),
+                    ) {
+                        SearchCard(nav, idx)
+                        Spacer(Modifier.height(16.dp))
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                            EntryCard(
+                                Modifier.weight(1f),
+                                icon = { Icon(Icons.Default.ConfirmationNumber, null, tint = Color(0xFF0B57D0)) },
+                                title = "我的订单",
+                                sub = "支付 / 改签 / 退票",
+                            ) { nav.navigate("orders") }
+                            EntryCard(
+                                Modifier.weight(1f),
+                                icon = {
+                                    Icon(Icons.Default.Person, null, tint = Color(0xFF1E8E3E))
+                                },
+                                title = if (Session.isLoggedIn) "已登录" else "未登录",
+                                sub = if (Session.isLoggedIn) Session.displayMobile else "点击登录账号",
+                            ) {
+                                nav.navigate(if (Session.isLoggedIn) "profile" else "login")
+                            }
                         }
                     }
                 }
             }
         }
+
+        // 免责声明(主页底部)
+        Text(
+            "免责声明:本应用仅为购票辅助工具,不提供也不支持任何抢票、占票、倒卖加价等行为;" +
+                "请遵守客运站规定合理购票,班次、票价及车票信息以客运站官方发布为准。",
+            fontSize = 10.sp,
+            lineHeight = 15.sp,
+            textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.55f),
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 12.dp),
+        )
     }
 }
 
-@OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class, androidx.compose.material3.ExperimentalMaterial3Api::class)
+@OptIn(
+    androidx.compose.foundation.layout.ExperimentalLayoutApi::class,
+    androidx.compose.material3.ExperimentalMaterial3Api::class,
+    androidx.compose.foundation.ExperimentalFoundationApi::class,
+)
 @Composable
 private fun SearchCard(nav: NavController, idx: IndexInfo) {
     // uiTick 变化驱动重组(交换城市/清除历史后刷新界面)
     var uiTick by remember { mutableStateOf(0) }
     val start = remember(uiTick) { FlowState.startCity }
     val end = remember(uiTick) { FlowState.endCityName }
-    var date by remember { mutableStateOf(FlowState.pickDate.ifEmpty { idx.defaultDay }) }
-    var history by remember(uiTick) { mutableStateOf(com.yuecheng.ticket.data.SearchHistory.load()) }
+    var date by remember { mutableStateOf(FlowState.pickDate.ifEmpty { idx.defaultDay }.ifEmpty { idx.today }) }
+    var history by remember(uiTick) { mutableStateOf(SearchHistory.load()) }
+    var favs by remember(uiTick) { mutableStateOf(FavLines.load()) }
     var showDatePicker by remember { mutableStateOf(false) }
-    val scope = androidx.compose.runtime.rememberCoroutineScope()
+    val scope = rememberCoroutineScope()
 
     Card(
-        modifier = Modifier.fillMaxWidth().offsetUp(),
+        modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(16.dp),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
         elevation = CardDefaults.cardElevation(defaultElevation = 6.dp),
@@ -192,7 +229,7 @@ private fun SearchCard(nav: NavController, idx: IndexInfo) {
                                 val oldStart = start
                                 scope.launch {
                                     val all = FlowState.cachedStartPoints
-                                        ?: runCatching { Repo.startPoints().flatMap { it.second } }.getOrNull()
+                                        ?: resultOf { Repo.startPoints().flatMap { it.second } }.getOrNull()
                                     val baseEnd = end.substringBefore("(").trim()
                                     val matched = all?.firstOrNull { it.name == end }
                                         ?: all?.firstOrNull { it.name == baseEnd }
@@ -206,9 +243,9 @@ private fun SearchCard(nav: NavController, idx: IndexInfo) {
                                                 ?: oldStart.pinyin
                                         uiTick++
                                     } else {
-                                        android.widget.Toast.makeText(
+                                        Toast.makeText(
                                             nav.context, "「$end」暂不支持作为出发地",
-                                            android.widget.Toast.LENGTH_SHORT,
+                                            Toast.LENGTH_SHORT,
                                         ).show()
                                     }
                                 }
@@ -223,9 +260,7 @@ private fun SearchCard(nav: NavController, idx: IndexInfo) {
                     )
                 }
                 Column(
-                    Modifier.weight(1f).clickable {
-                        if (start != null) nav.navigate("endPick")
-                    },
+                    Modifier.weight(1f).clickable { nav.navigate("endPick") },
                     horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
                     Text(
@@ -258,7 +293,7 @@ private fun SearchCard(nav: NavController, idx: IndexInfo) {
                         else -> weekLabel(date)
                     }
                     Text(
-                        "${date.substring(5).replace('-', '月')}日 · $label",
+                        if (date.length >= 10) "${date.substring(5).replace('-', '月')}日 · $label" else label,
                         fontWeight = FontWeight.SemiBold, fontSize = 18.sp,
                     )
                     Row(verticalAlignment = Alignment.CenterVertically) {
@@ -280,8 +315,8 @@ private fun SearchCard(nav: NavController, idx: IndexInfo) {
                 onClick = {
                     if (start != null && end.isNotEmpty()) {
                         FlowState.pickDate = date
-                        com.yuecheng.ticket.data.SearchHistory.add(start.id, start.name, end, FlowState.endCityPinyin)
-                        history = com.yuecheng.ticket.data.SearchHistory.load()
+                        SearchHistory.add(start.id, start.name, end, FlowState.endCityPinyin)
+                        history = SearchHistory.load()
                         nav.navigate("shifts")
                     }
                 },
@@ -290,6 +325,70 @@ private fun SearchCard(nav: NavController, idx: IndexInfo) {
                 colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary),
             ) {
                 Text("查询车票", fontSize = 18.sp, fontWeight = FontWeight.Bold)
+            }
+
+            // 收藏线路:点击直接查询;长按移除;出发到达齐备时可一键收藏
+            if (favs.isNotEmpty() || (start != null && end.isNotEmpty())) {
+                HorizontalDivider(Modifier.padding(vertical = 12.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "收藏线路",
+                        fontSize = 13.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.width(10.dp))
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        favs.forEach { f ->
+                            Text(
+                                "★ ${f.startName}—${f.endName}",
+                                fontSize = 13.sp,
+                                color = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier
+                                    .background(MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f), RoundedCornerShape(6.dp))
+                                    .combinedClickable(
+                                        onClick = {
+                                            FlowState.startCity = StartCity(f.startId, f.startName, "", "", 0)
+                                            FlowState.endCityName = f.endName
+                                            FlowState.endCityPinyin = f.endPinyin
+                                            FlowState.pickDate = date
+                                            nav.navigate("shifts")
+                                        },
+                                        onLongClick = {
+                                            FavLines.remove(f.startId, f.endName)
+                                            favs = FavLines.load()
+                                            Toast.makeText(nav.context, "已移除「${f.startName}—${f.endName}」", Toast.LENGTH_SHORT).show()
+                                        },
+                                    )
+                                    .padding(horizontal = 8.dp, vertical = 3.dp),
+                            )
+                        }
+                        if (start != null && end.isNotEmpty()) {
+                            val isFav = FavLines.isFav(start.id, end)
+                            Text(
+                                if (isFav) "★ 已收藏" else "☆ 收藏此线路",
+                                fontSize = 13.sp,
+                                color = if (isFav) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.secondary,
+                                modifier = Modifier
+                                    .background(
+                                        MaterialTheme.colorScheme.secondary.copy(alpha = if (isFav) 0.08f else 0.12f),
+                                        RoundedCornerShape(6.dp),
+                                    )
+                                    .clickable {
+                                        if (isFav) {
+                                            FavLines.remove(start.id, end)
+                                        } else {
+                                            FavLines.add(start.id, start.name, end, FlowState.endCityPinyin)
+                                        }
+                                        favs = FavLines.load()
+                                    }
+                                    .padding(horizontal = 8.dp, vertical = 3.dp),
+                            )
+                        }
+                    }
+                }
             }
 
             // 历史记录:点击直接进入该车次列表
@@ -314,7 +413,7 @@ private fun SearchCard(nav: NavController, idx: IndexInfo) {
                                 modifier = Modifier
                                     .background(MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f), RoundedCornerShape(6.dp))
                                     .clickable {
-                                        FlowState.startCity = com.yuecheng.ticket.data.StartCity(h.startId, h.startName, "", "", 0)
+                                        FlowState.startCity = StartCity(h.startId, h.startName, "", "", 0)
                                         FlowState.endCityName = h.endName
                                         FlowState.endCityPinyin = h.endPinyin
                                         FlowState.pickDate = date
@@ -331,7 +430,7 @@ private fun SearchCard(nav: NavController, idx: IndexInfo) {
                             modifier = Modifier
                                 .background(MaterialTheme.colorScheme.error.copy(alpha = 0.08f), RoundedCornerShape(6.dp))
                                 .clickable {
-                                    com.yuecheng.ticket.data.SearchHistory.clear()
+                                    SearchHistory.clear()
                                     history = emptyList()
                                 }
                                 .padding(horizontal = 8.dp, vertical = 3.dp),
@@ -386,10 +485,6 @@ private fun SearchCard(nav: NavController, idx: IndexInfo) {
     }
 }
 
-private fun Modifier.offsetUp(): Modifier = this.then(
-    Modifier.padding(top = 0.dp),
-)
-
 @Composable
 private fun DateChip(text: String, enabled: Boolean, onClick: () -> Unit) {
     Text(
@@ -422,5 +517,52 @@ private fun EntryCard(
                 Text(sub, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
             }
         }
+    }
+}
+
+/** 副标题里的"退票":长按满 5 秒进入隐藏测试模式,按住时下方有进度条反馈 */
+@Composable
+private fun TestModeEntryText() {
+    var holding by remember { mutableStateOf(false) }
+    var showTestPanel by remember { mutableStateOf(false) }
+    val view = androidx.compose.ui.platform.LocalView.current
+
+    // 进度由动画时钟驱动(按住 5 秒线性推满),不再用定时轮询刷重组;松手快速归零
+    val holdProgress by animateFloatAsState(
+        targetValue = if (holding) 1f else 0f,
+        animationSpec = if (holding) tween(5000, easing = LinearEasing) else tween(150),
+        label = "holdProgress",
+    )
+
+    Box {
+        Text(
+            "退票",
+            color = Color(0xCCFFFFFF),
+            fontSize = 13.sp,
+            modifier = Modifier.pointerInput(Unit) {
+                detectTapGestures(
+                    onPress = {
+                        val start = System.currentTimeMillis()
+                        holding = true
+                        tryAwaitRelease()
+                        holding = false
+                        if (System.currentTimeMillis() - start >= 5000) {
+                            view.performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS)
+                            showTestPanel = true
+                        }
+                    },
+                )
+            },
+        )
+        if (holdProgress > 0f) {
+            androidx.compose.material3.LinearProgressIndicator(
+                progress = { holdProgress },
+                modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(2.dp),
+                trackColor = androidx.compose.ui.graphics.Color.Transparent,
+            )
+        }
+    }
+    if (showTestPanel) {
+        TestPanelDialog { showTestPanel = false }
     }
 }

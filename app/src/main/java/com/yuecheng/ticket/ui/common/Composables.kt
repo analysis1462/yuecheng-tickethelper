@@ -21,7 +21,6 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
@@ -37,30 +36,58 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import java.time.LocalDate
 import java.time.format.DateTimeFormatter
+import java.util.Locale
 
-/** 价格:分 -> 元字符串 */
+/** 价格:分 -> 元字符串(Locale.US 固定小数点,避免随设备区域变化) */
 fun cents(cents: String?): String {
     val v = cents?.toDoubleOrNull() ?: return "-"
-    return String.format("%.2f", v / 100)
+    return String.format(Locale.US, "%.2f", v / 100)
 }
 
 /** 价格:接口已给元的值,规整显示 */
 fun yuan(v: String?): String {
     val d = v?.toDoubleOrNull() ?: return "-"
-    return if (d == d.toLong().toDouble()) d.toLong().toString() else String.format("%.2f", d)
+    return if (d == d.toLong().toDouble()) d.toLong().toString() else String.format(Locale.US, "%.2f", d)
 }
+
+/** 简易 HTML 转纯文本(备注/规则字段常带内联样式);退改签规则与班次备注共用 */
+fun htmlToText(html: String?): String = html
+    ?.replace(Regex("(?is)<\\s*(br|/p|/div|/li|/h[1-6])[^>]*>"), "\n")
+    ?.replace(Regex("<[^>]*>"), "")
+    ?.replace("&nbsp;", " ")
+    ?.replace("&lt;", "<")
+    ?.replace("&gt;", ">")
+    ?.replace("&amp;", "&")
+    ?.replace(Regex("[ \\t]+"), " ")
+    ?.replace(Regex("\n\\s*\n+"), "\n\n")
+    ?.trim()
+    ?: ""
+
+/** 证件号脱敏展示:保留前 4 后 4,其余打码 */
+fun maskId(id: String?): String = when {
+    id == null -> "--"
+    id.length > 8 -> id.take(4) + "****" + id.takeLast(4)
+    else -> id
+}
+
+/** 日期统一按 yyyy-MM-dd 解析;接口偶发空值时不做崩溃处理,交由各页面回退 */
+private fun parseDate(s: String): LocalDate? = runCatching { LocalDate.parse(s) }.getOrNull()
 
 fun addDays(date: String, days: Long): String =
-    LocalDate.parse(date).plusDays(days).format(DateTimeFormatter.ISO_LOCAL_DATE)
+    parseDate(date)?.plusDays(days)?.format(DateTimeFormatter.ISO_LOCAL_DATE) ?: date
 
-fun dayDiff(a: String, b: String): Long =
-    LocalDate.parse(a).toEpochDay() - LocalDate.parse(b).toEpochDay()
+fun dayDiff(a: String, b: String): Long {
+    val da = parseDate(a) ?: return 0
+    val db = parseDate(b) ?: return 0
+    return da.toEpochDay() - db.toEpochDay()
+}
 
 fun weekLabel(date: String): String {
-    val d = LocalDate.parse(date)
-    val names = arrayOf("周一", "周二", "周三", "周四", "周五", "周六", "周日")
-    return names[d.dayOfWeek.value - 1]
+    val d = parseDate(date) ?: return ""
+    return arrayOf("周一", "周二", "周三", "周四", "周五", "周六", "周日")[d.dayOfWeek.value - 1]
 }
+
+// 发车时间解析已移至 data 包:com.yuecheng.ticket.data.departureEpochMillis(通知构建也要用)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -131,16 +158,6 @@ fun EmptyBox(text: String = "暂无数据") {
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Text(text, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
-}
-
-@Composable
-fun PrimaryButton(text: String, enabled: Boolean = true, modifier: Modifier = Modifier.fillMaxWidth().height(48.dp), onClick: () -> Unit) {
-    Button(onClick = onClick, enabled = enabled, modifier = modifier) { Text(text) }
-}
-
-@Composable
-fun SecondaryButton(text: String, modifier: Modifier = Modifier.fillMaxWidth().height(48.dp), onClick: () -> Unit) {
-    OutlinedButton(onClick = onClick, modifier = modifier) { Text(text) }
 }
 
 /** 未登录提示:"登录"二字蓝色下划线,点击任意位置跳转登录页 */

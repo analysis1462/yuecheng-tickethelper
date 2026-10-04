@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 桌面长按快捷方式:查票 / 我的订单(API 25+ 生效) -->
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <shortcut
+        android:enabled="true"
+        android:icon="@mipmap/ic_launcher"
+        android:shortcutDisabledMessage="@string/shortcut_disabled"
+        android:shortcutId="ticket"
+        android:shortcutLongLabel="@string/shortcut_ticket_long"
+        android:shortcutShortLabel="@string/shortcut_ticket">
+        <intent
+            android:action="com.yuecheng.ticket.action.NAV"
+            android:targetClass="com.yuecheng.ticket.MainActivity"
+            android:targetPackage="com.yuecheng.ticket">
+            <extra android:name="nav" android:value="home" />
+        </intent>
+    </shortcut>
+    <shortcut
+        android:enabled="true"
+        android:icon="@mipmap/ic_launcher"
+        android:shortcutDisabledMessage="@string/shortcut_disabled"
+        android:shortcutId="orders"
+        android:shortcutLongLabel="@string/shortcut_orders_long"
+        android:shortcutShortLabel="@string/shortcut_orders">
+        <intent
+            android:action="com.yuecheng.ticket.action.NAV"
+            android:targetClass="com.yuecheng.ticket.MainActivity"
+            android:targetPackage="com.yuecheng.ticket">
+            <extra android:name="nav" android:value="orders" />
+        </intent>
+    </shortcut>
+</shortcuts>

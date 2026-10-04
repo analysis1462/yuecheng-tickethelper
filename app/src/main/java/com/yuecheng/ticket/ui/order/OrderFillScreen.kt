@@ -1,9 +1,12 @@
 package com.yuecheng.ticket.ui.order
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -33,6 +36,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.referentialEqualityPolicy
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -47,29 +51,19 @@ import com.yuecheng.ticket.data.Passenger
 import com.yuecheng.ticket.data.Repo
 import com.yuecheng.ticket.data.Session
 import com.yuecheng.ticket.data.SuitInfo
+import com.yuecheng.ticket.data.resultOf
 import com.yuecheng.ticket.ui.common.ErrorBox
 import com.yuecheng.ticket.ui.common.LoadingBox
 import com.yuecheng.ticket.ui.common.YcScaffold
 import com.yuecheng.ticket.ui.common.cents
+import com.yuecheng.ticket.ui.common.htmlToText
 import com.yuecheng.ticket.ui.common.yuan
 import com.yuecheng.ticket.ui.pay.PayActivity
 import com.yuecheng.ticket.ui.shift.Tag
 import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
-
-/** 简易 HTML 转纯文本(备注/提示字段常带内联样式) */
-private fun htmlToPlainText(html: String?): String = html
-    ?.replace(Regex("(?is)<\\s*(br|/p|/div|/li|/h[1-6])[^>]*>"), "\n")
-    ?.replace(Regex("<[^>]*>"), "")
-    ?.replace("&nbsp;", " ")
-    ?.replace("&lt;", "<")
-    ?.replace("&gt;", ">")
-    ?.replace("&amp;", "&")
-    ?.replace(Regex("[ \\t]+"), " ")
-    ?.replace(Regex("\n\\s*\n+"), "\n")
-    ?.trim()
-    ?: ""
+import java.util.Locale
 
 @Composable
 fun OrderFillScreen(nav: NavController) {
@@ -77,16 +71,29 @@ fun OrderFillScreen(nav: NavController) {
     var suit by remember { mutableStateOf<SuitInfo?>(null) }
     var loading by remember { mutableStateOf(true) }
     var error by remember { mutableStateOf("") }
-    var passengers by remember { mutableStateOf(FlowState.selectedPassengers.toList()) }
+    // Passenger.tckType 是可变属性、不参与 data class equals,故用引用相等策略:
+    // 任何一次列表重建(换票种/移除乘客)都视为变更触发重组(费用明细不缓存,重组即重算)
+    var passengers by remember {
+        mutableStateOf(FlowState.selectedPassengers.toList(), referentialEqualityPolicy())
+    }
     var insure by remember { mutableStateOf(FlowState.insure) }
     var busy by remember { mutableStateOf(false) }
     var msg by remember { mutableStateOf("") }
     var typePickerFor by remember { mutableStateOf<Passenger?>(null) }
     val scope = rememberCoroutineScope()
 
+    // 从支付页返回后:清掉下单流程状态,跳到订单页(那里会自动轮询确认出票结果)
+    val payLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) {
+        FlowState.resetBooking()
+        nav.popBackStack("home", false)
+        nav.navigate("orders") { launchSingleTop = true }
+    }
+
     LaunchedEffect(shift) {
         if (shift == null) { error = "请先选择班次"; loading = false; return@LaunchedEffect }
-        runCatching { Repo.suit(FlowState.startCity?.id ?: "", shift.shiftIdJson()) }
+        resultOf { Repo.suit(FlowState.startCity?.id ?: "", shift.shiftIdJson()) }
             .onSuccess {
                 suit = it
                 FlowState.suit = it
@@ -102,10 +109,13 @@ fun OrderFillScreen(nav: NavController) {
 
     val info = suit?.shiftInfo
     val scheme = suit?.scheme
-    val maxSell = info?.maxSellNum?.toIntOrNull() ?: 5
+    val maxSell = info?.maxSellNum?.toIntOrNull()?.takeIf { it > 0 } ?: 5
 
-    // 费用明细(与 H5 计算一致,单位:分 -> 元)
-    val priceLines: List<Triple<String, Double, Int>> = remember(passengers, insure, suit) {
+    // 费用明细(与 H5 计算一致,单位:分 -> 元)。
+    // 刻意不 remember:Passenger.tckType 是可变属性、不参与 data class equals,
+    // remember 的键按 equals 比较,缓存会让「换票种」后的明细与合计停留在旧值;
+    // 每次重组直接重算(人数少,开销可忽略)
+    val priceLines: List<Triple<String, Double, Int>> = run {
         val lines = mutableListOf<Triple<String, Double, Int>>()
         if (info != null && scheme != null) {
             val seen = linkedMapOf<String, Pair<Double, Int>>() // type -> (单价元, 数量)
@@ -141,7 +151,7 @@ fun OrderFillScreen(nav: NavController) {
                 Column(Modifier.fillMaxSize().padding(p)) {
                     LazyColumn(
                         Modifier.fillMaxSize().weight(1f),
-                        contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
+                        contentPadding = PaddingValues(16.dp),
                         verticalArrangement = Arrangement.spacedBy(12.dp),
                     ) {
                         // 班次信息卡
@@ -157,7 +167,7 @@ fun OrderFillScreen(nav: NavController) {
                                         if (info.isExpressway == "1") Tag("高速", MaterialTheme.colorScheme.primary)
                                         if (info.flowDelay) Tag("流水班", MaterialTheme.colorScheme.tertiary)
                                         Spacer(Modifier.weight(1f))
-                                        Text("余票 ${info.leftSeatNum}", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                        Text("余票 ${info.leftSeatNum ?: "--"}", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                     }
                                     Spacer(Modifier.height(6.dp))
                                     Text("${info.stationName} → ${info.endPortName ?: info.portName}", fontSize = 14.sp)
@@ -180,8 +190,11 @@ fun OrderFillScreen(nav: NavController) {
                                             "添加乘车人",
                                             color = MaterialTheme.colorScheme.primary,
                                             modifier = Modifier.clickable {
-                                                if (!Session.isLoggedIn) nav.navigate("login")
-                                                else nav.navigate("passengers/1")
+                                                when {
+                                                    !Session.isLoggedIn -> nav.navigate("login")
+                                                    passengers.size >= maxSell -> msg = "最多选择 $maxSell 人"
+                                                    else -> nav.navigate("passengers/1")
+                                                }
                                             },
                                         )
                                     }
@@ -242,20 +255,20 @@ fun OrderFillScreen(nav: NavController) {
                                     priceLines.forEach { (label, price, count) ->
                                         Row(Modifier.padding(vertical = 3.dp)) {
                                             Text("$label × $count", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.weight(1f))
-                                            Text("¥${"%.2f".format(price * count)}", fontSize = 13.sp)
+                                            Text(String.format(Locale.US, "¥%.2f", price * count), fontSize = 13.sp)
                                         }
                                     }
                                     HorizontalDivider(Modifier.padding(vertical = 8.dp))
                                     Row {
                                         Text("合计", fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                                        Text("¥${"%.2f".format(totalPrice)}", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.secondary, fontSize = 18.sp)
+                                        Text(String.format(Locale.US, "¥%.2f", totalPrice), fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.secondary, fontSize = 18.sp)
                                     }
                                 }
                             }
                         }
 
                         // 温馨提示(纯文本化,空则不显示,避免出现空白卡片)
-                        val remarkText = htmlToPlainText(info.remark)
+                        val remarkText = htmlToText(info.remark)
                         if (remarkText.isNotBlank()) {
                             item {
                                 Card(
@@ -280,7 +293,7 @@ fun OrderFillScreen(nav: NavController) {
                                 if (!Session.isLoggedIn) { nav.navigate("login"); return@Button }
                                 scope.launch {
                                     busy = true; msg = ""
-                                    runCatching {
+                                    resultOf {
                                         val arr = JSONArray()
                                         passengers.forEach { person ->
                                             arr.put(
@@ -297,14 +310,14 @@ fun OrderFillScreen(nav: NavController) {
                                             startId = FlowState.startCity?.id ?: "",
                                             shiftIdJson = info.shiftIdJson(),
                                             insureCompany = info.insureCompany ?: "",
-                                            hasActivity = scheme.activityId != null,
+                                            hasActivity = !scheme.activityId.isNullOrEmpty(),
                                             activityId = scheme.activityId,
                                             passengerListJson = arr.toString(),
                                         )
                                     }.onSuccess { payUrl ->
                                         FlowState.selectedPassengers = passengers.toMutableList()
                                         FlowState.insure = insure
-                                        PayActivity.start(nav.context, payUrl)
+                                        payLauncher.launch(PayActivity.intent(nav.context, payUrl))
                                     }.onFailure { msg = it.message ?: "下单失败" }
                                     busy = false
                                 }
@@ -312,7 +325,11 @@ fun OrderFillScreen(nav: NavController) {
                             enabled = !busy && passengers.isNotEmpty(),
                             modifier = Modifier.fillMaxWidth().height(50.dp),
                         ) {
-                            Text(if (busy) "提交中…" else "提交订单  ¥${"%.2f".format(totalPrice)}", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                            Text(
+                                if (busy) "提交中…"
+                                else String.format(Locale.US, "提交订单  ¥%.2f", totalPrice),
+                                fontWeight = FontWeight.Bold, fontSize = 16.sp,
+                            )
                         }
                     }
                 }

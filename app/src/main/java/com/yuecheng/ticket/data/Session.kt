@@ -18,6 +18,8 @@ object Session {
 
     fun init(context: Context) {
         prefs = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        // 清掉旧版本可能残留的明文凭据键
+        prefs.edit().remove("sm").remove("sp").apply()
     }
 
     var user: JsonObject? = null
@@ -41,16 +43,20 @@ object Session {
         loginTick.value++
     }
 
-    /** 保存登录凭据用于会话失效时静默重登 */
-    val savedMobile: String get() = prefs.getString("sm", "") ?: ""
-    val savedPassword: String get() = prefs.getString("sp", "") ?: ""
+    /** 保存登录凭据用于会话失效时静默重登(Keystore 加密落盘,不存明文) */
+    val savedMobile: String get() = SecureStore.decrypt(prefs.getString("sm_enc", null)).orEmpty()
+    val savedPassword: String get() = SecureStore.decrypt(prefs.getString("sp_enc", null)).orEmpty()
+
     fun setCredentials(mobile: String, password: String) {
-        prefs.edit().putString("sm", mobile).putString("sp", password).apply()
+        prefs.edit()
+            .putString("sm_enc", SecureStore.encrypt(mobile).orEmpty())
+            .putString("sp_enc", SecureStore.encrypt(password).orEmpty())
+            .apply()
     }
 
     fun logout() {
         user = null
-        prefs.edit().remove(KEY_USER).remove("sm").remove("sp").apply()
+        prefs.edit().remove(KEY_USER).remove("sm_enc").remove("sp_enc").apply()
         runCatching { Api.clearCookies() }
         loginTick.value++
     }
@@ -156,5 +162,54 @@ object SearchHistory {
 
     fun clear() {
         prefs.edit().remove(KEY).apply()
+    }
+}
+
+/** 收藏线路(持久化,固定常用线路,最多 12 条) */
+data class FavLine(val startId: String, val startName: String, val endName: String, val endPinyin: String)
+
+object FavLines {
+    private const val PREFS = "yc_favs"
+    private const val KEY = "list"
+    private lateinit var prefs: android.content.SharedPreferences
+
+    fun init(context: Context) {
+        prefs = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+    }
+
+    fun load(): List<FavLine> = runCatching {
+        val raw = prefs.getString(KEY, null) ?: return emptyList()
+        com.google.gson.JsonParser.parseString(raw).asJsonArray.mapNotNull { e ->
+            val o = e.asJsonObject
+            FavLine(
+                o.get("s")?.asString ?: return@mapNotNull null,
+                o.get("sn")?.asString ?: return@mapNotNull null,
+                o.get("e")?.asString ?: return@mapNotNull null,
+                o.get("ep")?.asString ?: "",
+            )
+        }
+    }.getOrDefault(emptyList())
+
+    fun add(startId: String, startName: String, endName: String, endPinyin: String = "") {
+        if (startId.isEmpty() || endName.isEmpty()) return
+        val next = listOf(FavLine(startId, startName, endName, endPinyin)) +
+            load().filter { !(it.startId == startId && it.endName == endName) }
+        save(next.take(12))
+    }
+
+    fun remove(startId: String, endName: String) {
+        save(load().filter { !(it.startId == startId && it.endName == endName) })
+    }
+
+    fun isFav(startId: String?, endName: String): Boolean =
+        startId != null && load().any { it.startId == startId && it.endName == endName }
+
+    private fun save(list: List<FavLine>) {
+        prefs.edit().putString(KEY, com.google.gson.Gson().toJson(list.map {
+            com.google.gson.JsonObject().apply {
+                addProperty("s", it.startId); addProperty("sn", it.startName)
+                addProperty("e", it.endName); addProperty("ep", it.endPinyin)
+            }
+        })).apply()
     }
 }

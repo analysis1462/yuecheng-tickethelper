@@ -1,3 +1,10 @@
 <resources>
     <string name="app_name">悦程购票</string>
+
+    <!-- 桌面快捷方式 -->
+    <string name="shortcut_ticket">查票</string>
+    <string name="shortcut_ticket_long">查询车票</string>
+    <string name="shortcut_orders">订单</string>
+    <string name="shortcut_orders_long">我的订单</string>
+    <string name="shortcut_disabled">快捷方式不可用</string>
 </resources>

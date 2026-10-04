@@ -1,0 +1,7 @@
+<resources>
+    <!-- windowLightStatusBar 是 API 23 属性,仅在 v23 及以上启用 -->
+    <style name="Theme.YC" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">true</item>
+    </style>
+</resources>

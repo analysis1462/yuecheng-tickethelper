@@ -10,7 +10,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -34,6 +34,7 @@ import androidx.navigation.NavController
 import com.yuecheng.ticket.data.FlowState
 import com.yuecheng.ticket.data.Repo
 import com.yuecheng.ticket.data.Shift
+import com.yuecheng.ticket.data.resultOf
 import com.yuecheng.ticket.ui.common.ErrorBox
 import com.yuecheng.ticket.ui.common.LoadingBox
 import com.yuecheng.ticket.ui.common.EmptyBox
@@ -56,13 +57,17 @@ fun ChangeScreen(nav: NavController, orderId: String) {
     var busy by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
-    LaunchedEffect(orderId) {
+    LaunchedEffect(orderId, date) {
         val o = order ?: run { error = "缺少订单信息"; loading = false; return@LaunchedEffect }
-        loading = true
-        runCatching {
-            Repo.changeShifts(orderId, o.subOrderId, date, o.seatNo)
-        }.onSuccess { shifts = it; loading = false }
-            .onFailure { error = it.message ?: "加载失败"; loading = false }
+        loading = true; error = ""
+        try {
+            shifts = Repo.changeShifts(orderId, o.subOrderId, date, o.seatNo)
+        } catch (ce: kotlinx.coroutines.CancellationException) {
+            throw ce // 切换日期时上一次请求被取消,不算失败
+        } catch (e: Exception) {
+            error = e.message ?: "加载失败"
+        }
+        loading = false
     }
 
     val maxDate = FlowState.startIndex?.let { addDays(it.today, it.presellDay.toLong()) }
@@ -75,28 +80,12 @@ fun ChangeScreen(nav: NavController, orderId: String) {
             ) {
                 TextButton(enabled = date > (FlowState.startIndex?.today ?: date), onClick = {
                     date = addDays(date, -1)
-                    val o = order
-                    scope.launch {
-                        loading = true
-                        if (o != null) {
-                            runCatching { Repo.changeShifts(orderId, o.subOrderId, date, o.seatNo) }
-                                .onSuccess { shifts = it; loading = false }
-                                .onFailure { error = it.message ?: "加载失败"; loading = false }
-                        } else loading = false
-                    }
                 }) { Text("前一天") }
                 Spacer(Modifier.weight(1f))
                 Text("$date ${weekLabel(date)}", fontWeight = FontWeight.SemiBold)
                 Spacer(Modifier.weight(1f))
                 TextButton(enabled = maxDate == null || date < maxDate, onClick = {
                     date = addDays(date, 1)
-                    val o = order ?: return@TextButton
-                    scope.launch {
-                        loading = true
-                        runCatching { Repo.changeShifts(orderId, o.subOrderId, date, o.seatNo) }
-                            .onSuccess { shifts = it; loading = false }
-                            .onFailure { error = it.message ?: "加载失败"; loading = false }
-                    }
                 }) { Text("后一天") }
             }
 
@@ -109,7 +98,11 @@ fun ChangeScreen(nav: NavController, orderId: String) {
                     contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
                     verticalArrangement = Arrangement.spacedBy(10.dp),
                 ) {
-                    items(shifts, key = { "${it.stationId}-${it.shiftNum}-${it.sendTime}" }) { s ->
+                    itemsIndexed(
+                        shifts,
+                        // 班次唯一性无法完全保证,key 追加下标避免重复 key 崩溃
+                        key = { i, s -> "${s.stationId}-${s.shiftNum}-${s.sendTime}-$i" },
+                    ) { _, s ->
                         Card(
                             shape = RoundedCornerShape(12.dp),
                             modifier = Modifier.fillMaxWidth().clickable { target = s },
@@ -145,10 +138,12 @@ fun ChangeScreen(nav: NavController, orderId: String) {
                 TextButton(
                     enabled = !busy,
                     onClick = {
+                        // order 为 null 时列表根本不会加载,target 不会出现;此处守卫仅为消除强制解包
+                        val o = order ?: return@TextButton
                         scope.launch {
                             busy = true
-                            runCatching {
-                                Repo.change(orderId, order!!.subOrderId, order.seatNo, s.sendDate, s)
+                            resultOf {
+                                Repo.change(orderId, o.subOrderId, o.seatNo, s.sendDate, s)
                             }.onSuccess {
                                 target = null
                                 FlowState.changeOrder = null

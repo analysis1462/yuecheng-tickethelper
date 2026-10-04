@@ -18,6 +18,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.FileDownload
+import androidx.compose.material.icons.filled.FileUpload
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -46,14 +48,23 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.navigation.NavController
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import android.widget.Toast
 import com.yuecheng.ticket.data.CardType
 import com.yuecheng.ticket.data.FlowState
+import com.yuecheng.ticket.data.IdCard
+import com.yuecheng.ticket.data.NeedLoginException
 import com.yuecheng.ticket.data.Passenger
 import com.yuecheng.ticket.data.Repo
 import com.yuecheng.ticket.data.Session
+import com.yuecheng.ticket.data.resultOf
 import com.yuecheng.ticket.ui.common.ErrorBox
 import com.yuecheng.ticket.ui.common.LoadingBox
+import com.yuecheng.ticket.ui.common.LoginPrompt
 import com.yuecheng.ticket.ui.common.YcScaffold
+import com.yuecheng.ticket.ui.common.maskId
+import com.google.gson.JsonParser
 import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -69,12 +80,18 @@ fun PassengersScreen(nav: NavController, chooseMode: Boolean) {
     var needLogin by remember { mutableStateOf(false) }
     // 选中的证件号集合(可观察:勾选/行点击立即刷新界面)
     var selectedIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+    // 导入/导出的结果提示
+    var transferMsg by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
+
+    // 最多可购人数:优先班次,其次套餐详情,默认 5(与 H5 口径一致)
+    val maxSell = (FlowState.shift?.maxSellNum ?: FlowState.suit?.shiftInfo?.maxSellNum)
+        ?.toIntOrNull()?.takeIf { it > 0 } ?: 5
 
     fun reload() {
         scope.launch {
             loading = true; error = ""; needLogin = false
-            runCatching {
+            resultOf {
                 Repo.passengers(FlowState.shift?.stationId ?: "", Session.customerId)
             }.onSuccess {
                 list = it.first; cards = it.second
@@ -83,7 +100,7 @@ fun PassengersScreen(nav: NavController, chooseMode: Boolean) {
                 loading = false
             }.onFailure {
                 loading = false
-                if (it is com.yuecheng.ticket.data.NeedLoginException) {
+                if (it is NeedLoginException) {
                     if (Session.isLoggedIn) Session.logout()
                     needLogin = true
                 } else {
@@ -94,16 +111,101 @@ fun PassengersScreen(nav: NavController, chooseMode: Boolean) {
     }
     LaunchedEffect(Unit) { reload() }
 
+    // 乘客数据导出(SAF 写文件,不申请存储权限)
+    val exportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/json"),
+    ) { uri ->
+        if (uri != null) {
+            scope.launch {
+                val json = org.json.JSONObject().apply {
+                    put("exported", java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.US)
+                        .format(java.util.Date()))
+                    put("passengers", org.json.JSONArray().apply {
+                        list.forEach { p ->
+                            put(org.json.JSONObject()
+                                .put("name", p.name ?: "")
+                                .put("idcardType", p.idcardType ?: "1")
+                                .put("idcardNo", p.idcardNo ?: "")
+                                .put("mobile", p.mobile ?: ""))
+                        }
+                    })
+                }.toString()
+                runCatching {
+                    nav.context.contentResolver.openOutputStream(uri)?.use {
+                        it.write(json.toByteArray(Charsets.UTF_8))
+                    } ?: throw IllegalStateException("无法写入文件")
+                }.onSuccess { transferMsg = "已导出 ${list.size} 位乘车人" }
+                    .onFailure { transferMsg = "导出失败:${it.message}" }
+            }
+        }
+    }
+
+    // 乘客数据导入:与账号内现有乘车人按证件号去重,逐个调用新增接口
+    val importLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        if (uri != null) {
+            scope.launch {
+                runCatching {
+                    val bytes = nav.context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                        ?: throw IllegalStateException("无法读取文件")
+                    // 误选超大文件时整读会占内存:超过 1MB 直接判为选错文件
+                    if (bytes.size > 1_048_576) throw IllegalStateException("文件超过 1MB,请确认选择了正确的备份文件")
+                    val text = bytes.toString(Charsets.UTF_8)
+                    val root = JsonParser.parseString(text)
+                    val arr = if (root.isJsonArray) root.asJsonArray
+                    else root.asJsonObject.get("passengers")?.asJsonArray
+                        ?: throw IllegalStateException("文件格式不正确")
+                    arr.mapNotNull { e ->
+                        val o = e.asJsonObject
+                        Triple(
+                            o.get("name")?.asString ?: "",
+                            o.get("idcardNo")?.asString ?: "",
+                            (o.get("idcardType")?.asString ?: "1") to (o.get("mobile")?.asString ?: ""),
+                        )
+                    }
+                }.map { entries ->
+                    val existing = list.mapNotNull { it.idcardNo }.toMutableSet()
+                    var ok = 0; var skip = 0; var fail = 0
+                    entries.forEach { (name, idNo, typeMobile) ->
+                        when {
+                            idNo.isEmpty() || name.isEmpty() || idNo in existing -> skip++
+                            else -> resultOf {
+                                Repo.addPassenger(
+                                    Session.customerId, name, typeMobile.first, idNo, typeMobile.second,
+                                )
+                            }.onSuccess {
+                                existing += idNo; ok++
+                            }.onFailure { fail++ }
+                        }
+                    }
+                    reload()
+                    transferMsg = "导入完成:新增 $ok,跳过 $skip" + (if (fail > 0) ",失败 $fail" else "")
+                }.onFailure { transferMsg = "导入失败:${it.message}" }
+            }
+        }
+    }
+
+    transferMsg?.let { msg ->
+        LaunchedEffect(msg) {
+            Toast.makeText(nav.context, msg, Toast.LENGTH_LONG).show()
+            transferMsg = null
+        }
+    }
+
     /** 勾选/取消:更新可观察集合并同步到 FlowState(自动补默认票种,票价计算依赖它) */
     fun toggleSelect(person: Passenger) {
         val id = person.idcardNo ?: return
+        if (id !in selectedIds && selectedIds.size >= maxSell) {
+            Toast.makeText(nav.context, "最多选择 $maxSell 人", Toast.LENGTH_SHORT).show()
+            return
+        }
         val next = if (id in selectedIds) selectedIds - id else selectedIds + id
         selectedIds = next
         val defaultTck = FlowState.shift?.tckTypeList?.firstOrNull()
             ?: FlowState.suit?.shiftInfo?.tckTypeList?.firstOrNull()
         FlowState.selectedPassengers = list.filter { it.idcardNo != null && it.idcardNo in next }
             .map { p ->
-                p.selected = true
                 if (p.tckType == null) p.tckType = defaultTck
                 p
             }
@@ -113,11 +215,25 @@ fun PassengersScreen(nav: NavController, chooseMode: Boolean) {
     YcScaffold(
         title = if (chooseMode) "选择乘车人" else "乘车人管理",
         onBack = { nav.popBackStack() },
+        actions = {
+            // 管理模式下提供乘客数据备份:导出 JSON / 从 JSON 导入
+            if (!chooseMode && list.isNotEmpty()) {
+                IconButton(onClick = { exportLauncher.launch("yuecheng-passengers.json") }) {
+                    Icon(Icons.Default.FileUpload, "导出乘车人")
+                }
+                IconButton(onClick = {
+                    if (Session.isLoggedIn) importLauncher.launch(arrayOf("application/json", "text/plain"))
+                    else android.widget.Toast.makeText(nav.context, "请先登录", android.widget.Toast.LENGTH_SHORT).show()
+                }) {
+                    Icon(Icons.Default.FileDownload, "导入乘车人")
+                }
+            }
+        },
     ) { p ->
         Box(Modifier.fillMaxSize().padding(p)) {
             when {
                 loading -> LoadingBox()
-                needLogin -> com.yuecheng.ticket.ui.common.LoginPrompt { nav.navigate("login") }
+                needLogin -> LoginPrompt { nav.navigate("login") }
                 error.isNotEmpty() -> ErrorBox(error) { reload() }
                 list.isEmpty() -> {
                     Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) {
@@ -158,6 +274,16 @@ fun PassengersScreen(nav: NavController, chooseMode: Boolean) {
                                             "${cardLabel(cards, person.idcardType)} ${maskId(person.idcardNo ?: "")}",
                                             fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
                                         )
+                                        // 身份证:推算生日与性别展示(仅显示,下单以证件号为准)
+                                        if (person.idcardType == "1") {
+                                            val derived = listOfNotNull(
+                                                IdCard.gender(person.idcardNo),
+                                                IdCard.birth(person.idcardNo),
+                                            ).joinToString(" · ")
+                                            if (derived.isNotEmpty()) {
+                                                Text(derived, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                            }
+                                        }
                                         person.mobile?.takeIf { it.isNotEmpty() }?.let {
                                             Text(it, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                         }
@@ -195,7 +321,7 @@ fun PassengersScreen(nav: NavController, chooseMode: Boolean) {
             onDismiss = { showAdd = false; editing = null },
             onSave = { name, idType, idNo, mobileNo ->
                 scope.launch {
-                    runCatching {
+                    resultOf {
                         if (target == null) {
                             Repo.addPassenger(Session.customerId, name, idType, idNo, mobileNo)
                         } else {
@@ -217,13 +343,14 @@ fun PassengersScreen(nav: NavController, chooseMode: Boolean) {
             title = { Text("删除乘车人") },
             text = { Text("确定删除 ${person.name} 吗?") },
             confirmButton = {
-                TextButton(onClick = {
-                    scope.launch {
-                        runCatching { Repo.delPassenger(Session.customerId, person.id ?: "") }
-                        deleting = null; reload()
-                    }
-                }) { Text("删除", color = MaterialTheme.colorScheme.error) }
-            },
+                    TextButton(onClick = {
+                        scope.launch {
+                            resultOf { Repo.delPassenger(Session.customerId, person.id ?: "") }
+                                .onSuccess { deleting = null; reload() }
+                                .onFailure { err -> error = err.message ?: "删除失败"; deleting = null }
+                        }
+                    }) { Text("删除", color = MaterialTheme.colorScheme.error) }
+                },
             dismissButton = { TextButton(onClick = { deleting = null }) { Text("取消") } },
         )
     }
@@ -240,7 +367,10 @@ private fun EditPassengerDialog(
     var idType by remember { mutableStateOf(initial?.idcardType ?: "1") }
     var idNo by remember { mutableStateOf(initial?.idcardNo ?: "") }
     var mobile by remember { mutableStateOf(initial?.mobile ?: "") }
-    val valid = name.isNotBlank() && idNo.length >= 15 && mobile.length == 11
+    // 身份证做校验位/出生日期校验(含 X),其他证件类型只校验非空与最小长度
+    val idError = if (idType == "1" && idNo.isNotEmpty()) IdCard.validate(idNo) else null
+    val idNoValid = if (idType == "1") idNo.isNotEmpty() && idError == null else idNo.length >= 5
+    val valid = name.isNotBlank() && idNoValid && mobile.length == 11
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -249,7 +379,22 @@ private fun EditPassengerDialog(
             Column {
                 OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text("姓名") }, singleLine = true)
                 Spacer(Modifier.height(8.dp))
-                OutlinedTextField(value = idNo, onValueChange = { idNo = it.uppercase() }, label = { Text("证件号码") }, singleLine = true)
+                OutlinedTextField(
+                    value = idNo,
+                    onValueChange = { idNo = it.uppercase().filter { c -> !c.isWhitespace() } },
+                    label = { Text("证件号码") },
+                    singleLine = true,
+                    isError = idError != null,
+                    supportingText = {
+                        when {
+                            idError != null -> Text(idError, color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
+                            idType == "1" && idNo.length >= 15 -> {
+                                val info = listOfNotNull(IdCard.gender(idNo), IdCard.birth(idNo)).joinToString(" · ")
+                                if (info.isNotEmpty()) Text("校验通过:$info", fontSize = 12.sp)
+                            }
+                        }
+                    },
+                )
                 Spacer(Modifier.height(8.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("证件类型", fontSize = 13.sp)
@@ -277,6 +422,3 @@ private fun EditPassengerDialog(
 
 private fun cardLabel(cards: List<CardType>, value: String?): String =
     cards.firstOrNull { it.value == value }?.label ?: "身份证"
-
-private fun maskId(id: String): String =
-    if (id.length > 10) id.take(4) + "**********" + id.takeLast(4) else id

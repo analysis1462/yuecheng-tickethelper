@@ -39,6 +39,7 @@ import com.yuecheng.ticket.data.EndCity
 import com.yuecheng.ticket.data.FlowState
 import com.yuecheng.ticket.data.Repo
 import com.yuecheng.ticket.data.StartCity
+import com.yuecheng.ticket.data.resultOf
 import com.yuecheng.ticket.ui.common.ErrorBox
 import com.yuecheng.ticket.ui.common.LoadingBox
 import com.yuecheng.ticket.ui.common.YcScaffold
@@ -50,10 +51,11 @@ fun CityPickerScreen(nav: NavController, pickingStart: Boolean) {
     var startGroups by remember { mutableStateOf<List<Pair<String, List<StartCity>>>>(emptyList()) }
     var endGroups by remember { mutableStateOf<List<Pair<String, List<EndCity>>>>(emptyList()) }
     var keyword by remember { mutableStateOf("") }
+    var retryTick by remember { mutableStateOf(0) }
 
-    LaunchedEffect(pickingStart) {
+    LaunchedEffect(pickingStart, retryTick) {
         loading = true; error = ""
-        runCatching {
+        resultOf {
             if (pickingStart) {
                 startGroups = Repo.startPoints()
                 // 缓存全量表,供首页交换城市使用
@@ -79,7 +81,7 @@ fun CityPickerScreen(nav: NavController, pickingStart: Boolean) {
 
             when {
                 loading -> LoadingBox()
-                error.isNotEmpty() -> ErrorBox(error)
+                error.isNotEmpty() -> ErrorBox(error) { retryTick++ }
                 else -> {
                     if (pickingStart) {
                         val filtered = startGroups.map { (letter, list) ->
@@ -103,8 +105,9 @@ fun CityPickerScreen(nav: NavController, pickingStart: Boolean) {
                             }
                             filtered.forEach { (letter, list) ->
                                 item(key = "L$letter") { LetterHeader(letter) }
-                                list.forEach { city ->
-                                    item(key = city.id) {
+                                // 接口不保证 id 唯一/非空,key 用字母+下标保证唯一
+                                list.forEachIndexed { index, city ->
+                                    item(key = "S-$letter-$index") {
                                         CityRow(city.name, city.pinyin) {
                                             FlowState.startCity = city
                                             nav.popBackStack()
@@ -124,8 +127,9 @@ fun CityPickerScreen(nav: NavController, pickingStart: Boolean) {
                         LazyColumn(Modifier.fillMaxSize()) {
                             filtered.forEach { (letter, list) ->
                                 item(key = "L$letter") { LetterHeader(letter) }
-                                list.forEach { city ->
-                                    item(key = city.name) {
+                                // 重名到达地会导致 key 冲突,同样用字母+下标
+                                list.forEachIndexed { index, city ->
+                                    item(key = "E-$letter-$index") {
                                         CityRow(city.name, city.pinyin) {
                                             FlowState.endCityName = city.name
                                             FlowState.endCityPinyin = city.pinyin

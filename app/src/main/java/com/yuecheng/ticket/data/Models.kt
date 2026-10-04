@@ -69,6 +69,7 @@ data class Shift(
     val protocol: String?,
     val remind: String?,
 ) {
+    // 流水班"XX 前有效"的展示规则仅对山东(车站 id 区段 37)生效,与 H5 行为一致
     val flowDelay: Boolean get() = isFlow == "1" && stationId.startsWith("37")
 
     /** 备注 JSON 里的 remark 文本 */
@@ -76,9 +77,14 @@ data class Shift(
         memo?.let { com.google.gson.JsonParser.parseString(it).asJsonObject.s("remark") }
     }.getOrNull()
 
-    /** 下单用的 shiftId 复合串(与 H5 完全一致) */
-    fun shiftIdJson(): String =
-        """{"stationId":"$stationId","sendDate":"$sendDate","sendTime":"$sendTime","shiftNum":"$shiftNum","portName":"$portName"}"""
+    /** 下单用的 shiftId 复合串(与 H5 完全一致);用 JSONObject 序列化避免手工拼接产生非法 JSON */
+    fun shiftIdJson(): String = org.json.JSONObject().apply {
+        put("stationId", stationId)
+        put("sendDate", sendDate)
+        put("sendTime", sendTime)
+        put("shiftNum", shiftNum)
+        put("portName", portName)
+    }.toString()
 }
 
 data class Scheme(
@@ -99,9 +105,8 @@ data class Passenger(
     val idcardNo: String?,
     val idcardType: String?,
 ) {
-    var selected: Boolean = false
+    // 可变流程字段:不进构造属性,故不参与 data class equals(界面侧的刷新策略依赖这一点)
     var tckType: TckType? = null
-    var refundFee: Double = 0.0
 }
 
 data class CardType(val value: String?, val label: String?)
@@ -169,12 +174,22 @@ data class Ticket(
     val insurNumber: String?,
 )
 
+/** 主订单状态码(与服务端契约一致;子票状态码是另一套,"0"=购票成功,见 ticketStatusLabel) */
+object OrderStatus {
+    const val SUCCESS = "4"                // 购票成功
+    val PENDING_PAY = setOf("0", "2")      // 待支付
+    val ISSUING = setOf("1", "3")          // 正在出票
+    val FAILED = setOf("6", "7")           // 出票失败
+    /** 待出行 = 出票中或已购票成功(订单列表「待出行」页签口径) */
+    val TRAVEL_READY = ISSUING + SUCCESS
+}
+
 fun statusLabelOf(status: String?): String = when (status) {
-    "0", "2" -> "待支付"
-    "1", "3" -> "正在出票"
-    "4" -> "购票成功"
+    in OrderStatus.PENDING_PAY -> "待支付"
+    in OrderStatus.ISSUING -> "正在出票"
+    OrderStatus.SUCCESS -> "购票成功"
     "5" -> "已关闭"
-    "6", "7" -> "出票失败"
+    in OrderStatus.FAILED -> "出票失败"
     else -> "状态 $status"
 }
 
@@ -331,14 +346,6 @@ object Repo {
         )
     }
 
-    /** 图形验证码预检查(已注册返回 0000) */
-    suspend fun verification(mobile: String): Pair<Boolean, String> {
-        val r = Api.get("/login/verification", mapOf("mobile" to mobile))
-        val status = r.s("STATUS") ?: ""
-        val code = r.s("CODE") ?: ""
-        return Pair(status == "0000", code)
-    }
-
     suspend fun sendSmsCode(mobile: String, captcha: String) {
         val r = Api.post("/login/sendSMSCode", mapOf("mobile" to mobile, "validateCode" to captcha))
         if (r.s("STATUS") != "SUCCESS") throw ApiException(r.s("CODE") ?: "验证码发送失败")
@@ -414,29 +421,29 @@ object Repo {
         return@authed list to cards
     }
 
-    suspend fun addPassenger(customerId: String, name: String, idcardType: String, idcardNo: String, mobile: String): JsonObject {
-        val r = Api.post(
+    suspend fun addPassenger(customerId: String, name: String, idcardType: String, idcardNo: String, mobile: String): JsonObject = authed {
+        Api.post(
             "/login/addPassenger",
             mapOf(
                 "customerId" to b64(customerId), "name" to b64(name), "idcardType" to b64(idcardType),
                 "idcardNo" to b64(idcardNo), "mobile" to b64(mobile), "ttsId" to ttsId(),
             ),
-        )
-        return r.envelopeData()
+        ).envelopeData()
     }
 
-    suspend fun editPassenger(customerId: String, id: String, name: String, idcardType: String, idcardNo: String, mobile: String) {
+    suspend fun editPassenger(customerId: String, id: String, name: String, idcardType: String, idcardNo: String, mobile: String): JsonObject = authed {
         Api.post(
             "/login/editPassenger",
             mapOf(
-                "customerId" to customerId, "id" to id, "name" to name, "idcardType" to idcardType,
-                "idcardNo" to idcardNo, "mobile" to mobile, "ttsId" to ttsId(),
+                "customerId" to b64(customerId), "id" to id, "name" to b64(name), "idcardType" to b64(idcardType),
+                "idcardNo" to b64(idcardNo), "mobile" to b64(mobile), "ttsId" to ttsId(),
             ),
-        )
+        ).envelopeData()
     }
 
-    suspend fun delPassenger(customerId: String, id: String) {
+    suspend fun delPassenger(customerId: String, id: String): JsonObject = authed {
         Api.post("/login/delPassenger", mapOf("customerId" to customerId, "id" to id, "ttsId" to ttsId()))
+            .envelopeData()
     }
 
     /** 提交订单,成功返回 payUrl;0004 = 有未完成订单 */
@@ -461,7 +468,7 @@ object Repo {
         val code = r.s("CODE") ?: ""
         if (code == "0004") throw ApiException("您有未完成的订单,请到「我的订单」处理")
         if (code != "0000") throw ApiException(r.s("DATA") ?: code.ifEmpty { "下单失败" })
-        r.o("DATA")?.s("payUrl") ?: throw ApiException("未返回支付地址")
+        r.o("DATA")?.s("payUrl")?.takeIf { it.isNotEmpty() } ?: throw ApiException("未返回支付地址")
     }
 
     suspend fun orderList(): List<OrderSummary> = authed {
@@ -541,7 +548,7 @@ object Repo {
         val r = Api.get("/order/payOrder", mapOf("openId" to "", "orderId" to orderId))
         val code = r.s("CODE") ?: ""
         if (code != "0000") throw ApiException(r.s("DATA") ?: code.ifEmpty { "获取支付信息失败" })
-        r.o("DATA")?.s("payUrl") ?: throw ApiException("未返回支付地址")
+        r.o("DATA")?.s("payUrl")?.takeIf { it.isNotEmpty() } ?: throw ApiException("未返回支付地址")
     }
 
     suspend fun cancelOrder(orderId: String) = authed {
@@ -589,13 +596,9 @@ object Repo {
     private fun JsonElement.asJsonObjectOrNull(): JsonObject =
         (this as? JsonObject) ?: JsonObject()
 
-    private fun JsonObject.envelopeData(): JsonObject {
-        val status = s("STATUS")
-        if (status == "NEEDLOGIN") throw NeedLoginException()
-        if (status != null && status != "SUCCESS") throw ApiException(s("CODE") ?: "操作失败")
-        if (get("isSuccess")?.takeIf { it.isJsonPrimitive }?.asString == "false") throw ApiException("操作失败")
-        return o("DATA") ?: JsonObject()
-    }
+    /** 乘客接口的封装判定复用 Api.envelope 同一份实现,这里只把 DATA 收拢为 JsonObject */
+    private fun JsonObject.envelopeData(): JsonObject =
+        envelope().let { if (it.isJsonObject) it.asJsonObject else JsonObject() }
 }
 
 /** 可调参数 */

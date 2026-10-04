@@ -1,5 +1,6 @@
 package com.yuecheng.ticket.ui.theme
 
+import android.app.Activity
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -87,4 +88,17 @@ fun YcTheme(dark: Boolean? = null, content: @Composable () -> Unit) {
     )
 
     MaterialTheme(colorScheme = scheme, content = content)
+}
+
+/**
+ * 窗口背景跟随主题底色。主题 XML 恒为 Light,窗口底默认近白:
+ * Compose 页面转场(滑动+淡入淡出)和 Activity 打开/关闭动画期间,
+ * 界面半透明会透出窗口背景,夜间模式下白光晃眼。各 Activity 在 onCreate 里调用。
+ */
+fun Activity.applyWindowBackground(useDark: Boolean) {
+    window.setBackgroundDrawable(
+        android.graphics.drawable.ColorDrawable(
+            android.graphics.Color.parseColor(if (useDark) "#111318" else "#F4F6FA"),
+        )
+    )
 }

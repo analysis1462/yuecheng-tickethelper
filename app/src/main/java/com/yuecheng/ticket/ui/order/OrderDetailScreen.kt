@@ -2,12 +2,16 @@ package com.yuecheng.ticket.ui.order
 
 import android.graphics.Bitmap
 import android.graphics.Color
+import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -24,6 +28,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -31,32 +36,53 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
+import androidx.compose.runtime.referentialEqualityPolicy
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
 import androidx.navigation.NavController
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.oned.Code128Writer
+import com.yuecheng.ticket.data.DepartureReminder
+import com.yuecheng.ticket.data.NeedLoginException
 import com.yuecheng.ticket.data.OrderDetailData
+import com.yuecheng.ticket.data.OrderStatus
+import com.yuecheng.ticket.data.ReminderPlan
 import com.yuecheng.ticket.data.Repo
+import com.yuecheng.ticket.data.Session
 import com.yuecheng.ticket.data.Ticket
+import com.yuecheng.ticket.data.ChangeOrder
+import com.yuecheng.ticket.data.FlowState
+import com.yuecheng.ticket.data.departureEpochMillis
+import com.yuecheng.ticket.data.resultOf
+import com.yuecheng.ticket.data.routeText
 import com.yuecheng.ticket.data.statusLabelOf
+import com.yuecheng.ticket.data.ticketDetailText
 import com.yuecheng.ticket.data.ticketStatusLabel
 import com.yuecheng.ticket.ui.common.ErrorBox
 import com.yuecheng.ticket.ui.common.LoadingBox
+import com.yuecheng.ticket.ui.common.LoginPrompt
 import com.yuecheng.ticket.ui.common.YcScaffold
 import com.yuecheng.ticket.ui.common.cents
+import com.yuecheng.ticket.ui.common.htmlToText
+import com.yuecheng.ticket.ui.common.maskId
 import com.yuecheng.ticket.ui.common.yuan
 import com.yuecheng.ticket.ui.pay.PayActivity
 import com.yuecheng.ticket.ui.shift.Tag
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.util.Locale
 
 @Composable
 fun OrderDetailScreen(nav: NavController, orderId: String) {
@@ -70,17 +96,22 @@ fun OrderDetailScreen(nav: NavController, orderId: String) {
     var showQrFor by remember { mutableStateOf<String?>(null) }
     var showBarcodeFor by remember { mutableStateOf<String?>(null) }
     var needLogin by remember { mutableStateOf(false) }
+    var confirming by remember { mutableStateOf(false) }
+    var showCancelConfirm by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
+    val ctx = LocalContext.current
+    // 票码位图缓存:同码只生成一次,列表内嵌小图与全屏亮码共用
+    val codeBitmaps = remember { CodeBitmapCache() }
 
     fun reload() {
         scope.launch {
             loading = true; error = ""; needLogin = false
-            runCatching { Repo.orderDetail(orderId) }
+            resultOf { Repo.orderDetail(orderId) }
                 .onSuccess { data = it; loading = false }
                 .onFailure {
                     loading = false
-                    if (it is com.yuecheng.ticket.data.NeedLoginException) {
-                        if (com.yuecheng.ticket.data.Session.isLoggedIn) com.yuecheng.ticket.data.Session.logout()
+                    if (it is NeedLoginException) {
+                        if (Session.isLoggedIn) Session.logout()
                         needLogin = true
                     } else {
                         error = it.message ?: "加载失败"
@@ -90,17 +121,116 @@ fun OrderDetailScreen(nav: NavController, orderId: String) {
     }
     LaunchedEffect(orderId) { reload() }
 
+    /**
+     * 支付返回后轮询确认:网关回调有延迟,只刷一次常停留在"待支付"。
+     * 每 3 秒拉一次详情,直到状态离开"待支付"(出票中/成功/失败),最多约 50 秒。
+     */
+    fun confirmPayment() {
+        scope.launch {
+            confirming = true
+            repeat(16) {
+                kotlinx.coroutines.delay(3000)
+                resultOf { Repo.orderDetail(orderId) }.onSuccess {
+                    data = it
+                    val st = it.order.status
+                    if (st !in OrderStatus.PENDING_PAY) { confirming = false; return@launch }
+                }
+            }
+            confirming = false
+        }
+    }
+
+    // 支付返回后进入确认轮询
+    val payLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) { confirmPayment() }
+
+    // ---- 发车提醒:配置弹窗(提前量多选 + 闹钟开关),状态存 DepartureReminder ----
+    var reminderPlan by remember { mutableStateOf<ReminderPlan?>(null) }
+    var showReminder by remember { mutableStateOf(false) }
+    var pendingPlan by remember { mutableStateOf<ReminderPlan?>(null) }
+
+    /** 保存计划并刷新界面;成功(null)关弹窗并按实际状态提示,失败返回报错文案 */
+    fun persistPlan(plan: ReminderPlan): String? {
+        val err = DepartureReminder.save(ctx, plan)
+        reminderPlan = DepartureReminder.load(ctx, orderId)
+        if (err == null) {
+            showReminder = false
+            // 全部提前量已过期时 save 等同移除,按实际状态提示
+            Toast.makeText(
+                ctx,
+                when {
+                    reminderPlan == null -> "已移除提醒"
+                    plan.alarm -> "已设置闹钟式提醒"
+                    else -> "已设置发车提醒"
+                },
+                Toast.LENGTH_SHORT,
+            ).show()
+        }
+        return err
+    }
+
+    val notifPermLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        val plan = pendingPlan
+        pendingPlan = null
+        if (granted && plan != null) {
+            persistPlan(plan)?.let { Toast.makeText(ctx, it, Toast.LENGTH_LONG).show() }
+        } else if (!granted) android.widget.Toast.makeText(ctx, "未授予通知权限,无法设置提醒", android.widget.Toast.LENGTH_SHORT).show()
+    }
+
+    LaunchedEffect(orderId) {
+        // 清掉已过期的残留提醒记录,再载入本单的提醒计划
+        DepartureReminder.cleanupStale(ctx)
+        reminderPlan = DepartureReminder.load(ctx, orderId)
+    }
+
+    /** 返回 null 表示成功(关弹窗);返回文案为红色报错(弹窗内展示) */
+    fun saveReminderPlan(d: OrderDetailData, leads: List<Long>, alarm: Boolean): String? {
+        val millis = departureEpochMillis(d.order.sendDate, d.order.sendTime)
+        if (millis <= 0L) return "发车时间未知,无法设置提醒"
+        val plan = ReminderPlan(
+            orderId = orderId,
+            route = routeText(d.order.startName, d.order.endPortName, d.order.sendDate, d.order.sendTime),
+            departureMillis = millis,
+            leads = leads,
+            alarm = alarm,
+            // 票面要素快照(检票口/座位/车牌/发车位),通知触发时还会优先拉服务器最新值
+            detail = ticketDetailText(d),
+        )
+        if (android.os.Build.VERSION.SDK_INT >= 33 &&
+            ctx.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            pendingPlan = plan
+            notifPermLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+            return null
+        }
+        return persistPlan(plan)
+    }
+
     val d = data
     YcScaffold(title = "订单详情", onBack = { nav.popBackStack() }) { p ->
         when {
             loading -> LoadingBox()
-            needLogin -> com.yuecheng.ticket.ui.common.LoginPrompt { nav.navigate("login") }
+            needLogin -> LoginPrompt { nav.navigate("login") }
             error.isNotEmpty() -> ErrorBox(error) { reload() }
             d != null -> {
                 Column(Modifier.fillMaxSize().padding(p)) {
+                    if (confirming) {
+                        Row(
+                            Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            LinearProgressIndicator(Modifier.weight(1f))
+                            Spacer(Modifier.width(10.dp))
+                            Text("正在确认支付结果…", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
                     LazyColumn(
                         Modifier.fillMaxSize().weight(1f),
-                        contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
+                        contentPadding = PaddingValues(16.dp),
                         verticalArrangement = Arrangement.spacedBy(12.dp),
                     ) {
                         // 状态 + 订单号 + 取票密码
@@ -129,7 +259,7 @@ fun OrderDetailScreen(nav: NavController, orderId: String) {
                         // 电子客票凭证(每张票一张卡)
                         items(d.tickets.size) { i ->
                             TicketVoucherCard(
-                                d, d.tickets[i],
+                                d, d.tickets[i], codeBitmaps,
                                 onEnlargeBarcode = { showBarcodeFor = it },
                                 onEnlargeQr = { showQrFor = it },
                             )
@@ -152,25 +282,33 @@ fun OrderDetailScreen(nav: NavController, orderId: String) {
                             }
                         }
 
-                        // 退改签规则 / 使用须知 / 票样制作
+                        // 退改签规则 / 使用须知
                         item {
                             Card(shape = RoundedCornerShape(12.dp)) {
                                 Column(Modifier.padding(horizontal = 14.dp, vertical = 4.dp)) {
                                     Row(
                                         Modifier.fillMaxWidth().clickable {
-                                            val first = d.tickets.firstOrNull()
-                                            if (first != null) {
-                                                com.yuecheng.ticket.ui.pay.TicketEditorActivity.start(
-                                                    nav.context,
-                                                    buildTicketEditorPayload(d, first),
-                                                    "火车票_${d.shiftNumber?.takeIf { it.isNotEmpty() } ?: "样票"}_${d.order.sendDate ?: ""}",
-                                                )
+                                            if (departureEpochMillis(d.order.sendDate, d.order.sendTime) > 0L) {
+                                                showReminder = true
+                                            } else {
+                                                android.widget.Toast.makeText(ctx, "发车时间未知,无法设置提醒", android.widget.Toast.LENGTH_SHORT).show()
                                             }
                                         }.padding(vertical = 12.dp),
                                         verticalAlignment = Alignment.CenterVertically,
                                     ) {
-                                        Text("生成火车票样票", fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
-                                        Text("一键出图 ›", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                        Text("发车提醒", fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
+                                        Text(
+                                            reminderPlan?.label() ?: "发车前2小时 · 点击设置",
+                                            fontSize = 12.sp,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            modifier = Modifier.weight(2f),
+                                        )
+                                        Text(
+                                            if (reminderPlan != null) "修改" else "开启",
+                                            fontSize = 13.sp,
+                                            color = MaterialTheme.colorScheme.primary,
+                                            fontWeight = FontWeight.Medium,
+                                        )
                                     }
                                     HorizontalDivider()
                                     Row(
@@ -205,8 +343,10 @@ fun OrderDetailScreen(nav: NavController, orderId: String) {
                     }
 
                     // 底部操作栏
-                    val canPay = d.order.status == "0" || d.order.status == "2"
-                    val refundableTickets = d.order.status == "4" && d.tickets.any { it.status == "0" || it.status == "5" }
+                    val canPay = d.order.status in OrderStatus.PENDING_PAY
+                    // 子票状态码与主订单是另一套:"0"=购票成功,"5"=已退/关闭,二者可发起退票
+                    val refundableTickets = d.order.status == OrderStatus.SUCCESS &&
+                        d.tickets.any { it.status == "0" || it.status == "5" }
                     val canRefund = refundableTickets && d.isAllowRefund != "0"
                     val canChange = refundableTickets && d.isAllowChange == "1"
                     Column(Modifier.fillMaxWidth().padding(16.dp)) {
@@ -218,23 +358,15 @@ fun OrderDetailScreen(nav: NavController, orderId: String) {
                             if (canPay) {
                                 TextButton(
                                     enabled = !busy,
-                                    onClick = {
-                                        scope.launch {
-                                            busy = true
-                                            runCatching { Repo.cancelOrder(orderId) }
-                                                .onSuccess { reload() }
-                                                .onFailure { error = it.message ?: "取消失败" }
-                                            busy = false
-                                        }
-                                    },
+                                    onClick = { showCancelConfirm = true },
                                 ) { Text("取消订单", color = MaterialTheme.colorScheme.onSurfaceVariant) }
                                 Button(
                                     enabled = !busy,
                                     onClick = {
                                         scope.launch {
                                             busy = true
-                                            runCatching { Repo.payOrder(orderId) }
-                                                .onSuccess { PayActivity.start(nav.context, it) }
+                                            resultOf { Repo.payOrder(orderId) }
+                                                .onSuccess { payLauncher.launch(PayActivity.intent(nav.context, it)) }
                                                 .onFailure { error = it.message ?: "支付失败" }
                                             busy = false
                                         }
@@ -249,8 +381,8 @@ fun OrderDetailScreen(nav: NavController, orderId: String) {
                                     onClick = {
                                         val first = d.tickets.firstOrNull { it.seatNo != null } ?: d.tickets.firstOrNull()
                                         if (first != null) {
-                                            com.yuecheng.ticket.data.FlowState.changeOrder =
-                                                com.yuecheng.ticket.data.ChangeOrder(
+                                            FlowState.changeOrder =
+                                                ChangeOrder(
                                                     // suborderId 在订单对象上(实测),不是子票的 id
                                                     subOrderId = d.order.suborderId ?: first.suborderId ?: "",
                                                     seatNo = first.seatNo ?: "",
@@ -287,6 +419,47 @@ fun OrderDetailScreen(nav: NavController, orderId: String) {
         )
     }
 
+    // 取消订单二次确认(服务端操作不可逆,防误触)
+    if (showCancelConfirm) {
+        AlertDialog(
+            onDismissRequest = { showCancelConfirm = false },
+            title = { Text("取消订单") },
+            text = { Text("确定取消该订单吗?取消后需重新下单。") },
+            confirmButton = {
+                TextButton(onClick = {
+                    showCancelConfirm = false
+                    scope.launch {
+                        busy = true
+                        resultOf { Repo.cancelOrder(orderId) }
+                            .onSuccess { reload() }
+                            .onFailure { error = it.message ?: "取消失败" }
+                        busy = false
+                    }
+                }) { Text("确定取消", color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = { TextButton(onClick = { showCancelConfirm = false }) { Text("先不了") } },
+        )
+    }
+
+    // 发车提醒配置弹窗(提前量多选 + 闹钟开关)
+    if (showReminder && d != null) {
+        ReminderDialog(
+            route = routeText(d.order.startName, d.order.endPortName, d.order.sendDate, d.order.sendTime),
+            departureMillis = departureEpochMillis(d.order.sendDate, d.order.sendTime),
+            initial = reminderPlan,
+            onSave = { leads, alarm -> saveReminderPlan(d, leads, alarm) },
+            onRemove = {
+                // 幂等:移除此票全部提醒计划 + 清掉本应用发布的所有通知
+                DepartureReminder.cancel(ctx, orderId)
+                DepartureReminder.removeAllNotifications(ctx)
+                reminderPlan = null
+                showReminder = false
+                Toast.makeText(ctx, "已移除此票全部提醒与通知", Toast.LENGTH_SHORT).show()
+            },
+            onDismiss = { showReminder = false },
+        )
+    }
+
     // 退改签规则弹窗(与 H5 一致,展示购票协议全文)
     if (showRules && d != null) {
         val rulesText = htmlToText(d.protocol).ifEmpty { "暂无规则内容" }
@@ -305,12 +478,17 @@ fun OrderDetailScreen(nav: NavController, orderId: String) {
     }
 
     // 全屏亮码:乘车二维码 / 上车条码(与 H5 enlargeQRCode / enlargeCode 一致)
+    // 码图在后台线程生成并缓存:同码只算一次,列表内嵌小图与全屏亮码共用
     showQrFor?.let { code ->
-        val bmp = remember(code) { qrBitmap(code, 720) }
+        val bmp by produceState<Bitmap?>(null, code) {
+            value = withContext(Dispatchers.Default) { codeBitmaps.qr(code) }
+        }
         CodeDialog(title = "扫码时请调亮屏幕", bitmap = bmp, code = code, onDismiss = { showQrFor = null })
     }
     showBarcodeFor?.let { code ->
-        val bmp = remember(code) { barcodeBitmap(code, width = 1000, height = 260) }
+        val bmp by produceState<Bitmap?>(null, code) {
+            value = withContext(Dispatchers.Default) { codeBitmaps.barcode(code) }
+        }
         CodeDialog(title = "扫码时请调亮屏幕", bitmap = bmp, code = code, onDismiss = { showBarcodeFor = null })
     }
 }
@@ -320,6 +498,7 @@ fun OrderDetailScreen(nav: NavController, orderId: String) {
 private fun TicketVoucherCard(
     d: OrderDetailData,
     t: Ticket,
+    codeBitmaps: CodeBitmapCache,
     onEnlargeBarcode: (String) -> Unit,
     onEnlargeQr: (String) -> Unit,
 ) {
@@ -333,36 +512,42 @@ private fun TicketVoucherCard(
                 modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center,
             )
 
-                        // 电子客票号 + 条码 + 乘车二维码(点击放大亮码)
-                        t.qrCode?.takeIf { it.isNotEmpty() }?.let { code ->
-                            Spacer(Modifier.height(10.dp))
-                            Text("电子客票号:$code", fontSize = 13.sp, modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center)
-                            Spacer(Modifier.height(8.dp))
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                val bmp = remember(code) { barcodeBitmap(code) }
-                                val qbmp = remember(code) { qrBitmap(code) }
-                                Box(
-                                    Modifier.weight(1f).height(72.dp).clickable { onEnlargeBarcode(code) },
-                                    contentAlignment = Alignment.Center,
-                                ) {
-                                    if (bmp != null) {
-                                        Image(bmp.asImageBitmap(), "上车条码", modifier = Modifier.fillMaxWidth().height(60.dp))
-                                    }
-                                }
-                                Spacer(Modifier.width(12.dp))
-                                if (qbmp != null) {
-                                    Image(
-                                        qbmp.asImageBitmap(), "乘车二维码",
-                                        modifier = Modifier.size(88.dp).clickable { onEnlargeQr(code) },
-                                    )
-                                }
-                            }
-                            Text(
-                                "(仅限乘当日当次车 · 点击码图放大亮码)",
-                                fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center,
-                            )
+            // 电子客票号 + 条码 + 乘车二维码(点击放大亮码)
+            t.qrCode?.takeIf { it.isNotEmpty() }?.let { code ->
+                Spacer(Modifier.height(10.dp))
+                Text("电子客票号:$code", fontSize = 13.sp, modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center)
+                Spacer(Modifier.height(8.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    val bmpState = produceState<Bitmap?>(null, code) {
+                        value = withContext(Dispatchers.Default) { codeBitmaps.barcode(code) }
+                    }
+                    val qbmpState = produceState<Bitmap?>(null, code) {
+                        value = withContext(Dispatchers.Default) { codeBitmaps.qr(code) }
+                    }
+                    val bmp = bmpState.value
+                    val qbmp = qbmpState.value
+                    Box(
+                        Modifier.weight(1f).height(72.dp).clickable { onEnlargeBarcode(code) },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        if (bmp != null) {
+                            Image(bmp.asImageBitmap(), "上车条码", modifier = Modifier.fillMaxWidth().height(60.dp))
                         }
+                    }
+                    Spacer(Modifier.width(12.dp))
+                    if (qbmp != null) {
+                        Image(
+                            qbmp.asImageBitmap(), "乘车二维码",
+                            modifier = Modifier.size(88.dp).clickable { onEnlargeQr(code) },
+                        )
+                    }
+                }
+                Text(
+                    "(仅限乘当日当次车 · 点击码图放大亮码)",
+                    fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center,
+                )
+            }
 
             Spacer(Modifier.height(12.dp))
 
@@ -450,7 +635,7 @@ private fun InfoRow(label: String, value: String?) {
 /** 全屏亮码弹窗 */
 @Composable
 private fun CodeDialog(title: String, bitmap: Bitmap?, code: String, onDismiss: () -> Unit) {
-    androidx.compose.ui.window.Dialog(onDismissRequest = onDismiss) {
+    Dialog(onDismissRequest = onDismiss) {
         androidx.compose.material3.Surface(shape = RoundedCornerShape(16.dp)) {
             Column(
                 Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(20.dp),
@@ -472,6 +657,13 @@ private fun CodeDialog(title: String, bitmap: Bitmap?, code: String, onDismiss: 
             }
         }
     }
+}
+
+/** 票码位图缓存:同一票码的条码/二维码只生成一次,列表内嵌与放大亮码共用(生成失败不缓存,下次重试) */
+private class CodeBitmapCache {
+    private val map = mutableMapOf<String, Bitmap?>()
+    fun barcode(code: String): Bitmap? = map.getOrPut("bc:$code") { barcodeBitmap(code, width = 1000, height = 260) }
+    fun qr(code: String): Bitmap? = map.getOrPut("qr:$code") { qrBitmap(code, 720) }
 }
 
 /** Code128 条码(与 H5 JsBarcode 一致) */
@@ -500,55 +692,6 @@ private fun matrixToBitmap(matrix: com.google.zxing.common.BitMatrix, width: Int
     return bmp
 }
 
-private fun htmlToText(html: String?): String = html
-    ?.replace(Regex("(?is)<\\s*(br|/p|/div|/li|/h[1-6])[^>]*>"), "\n")
-    ?.replace(Regex("<[^>]*>"), "")
-    ?.replace("&nbsp;", " ")
-    ?.replace("&lt;", "<")
-    ?.replace("&gt;", ">")
-    ?.replace("&amp;", "&")
-    ?.replace(Regex("[ \\t]+"), " ")
-    ?.replace(Regex("\n\\s*\n+"), "\n\n")
-    ?.trim()
-    ?: ""
-
-private fun maskId(id: String?): String =
-    when {
-        id == null -> "--"
-        id.length > 8 -> id.take(4) + "****" + id.takeLast(4)
-        else -> id
-    }
-
-/**
- * 把汽车票信息映射为票样编辑器的草稿 JSON(键 = 编辑器表单控件 ID)。
- * 参考 12306-train-ticket-editor 的 collectForm() 字段结构。
- * 版面要求:站名只显示城市名;只显示座位号;不显示个人信息;
- * 附加信息行显示「限乘当日当次车」(infoline1="2"),不显示「仅供报销使用」(infoline2="1")。
- */
-private fun buildTicketEditorPayload(d: OrderDetailData, t: com.yuecheng.ticket.data.Ticket): String {
-    val payload = org.json.JSONObject().apply {
-        put("name", "")
-        put("identity", "")
-        put("startStation", d.order.startName ?: d.order.sendStationName ?: "")
-        put("endStation", d.order.endPortName ?: "")
-        put("trainNo", d.shiftNumber?.takeIf { it.isNotEmpty() } ?: "汽车")
-        put("date", d.order.sendDate ?: "")
-        put("time", d.order.sendTime ?: "")
-        put("seatClass", t.ticketTypeName ?: "全票")
-        put("seatNo", t.seatNo ?: "")
-        put("carriageNo", "")
-        put("price", t.price?.toDoubleOrNull()?.let { String.format("%.1f", it / 100) } ?: "")
-        put("checkinRoom", d.checkPort ?: "")
-        put("ticketNo", t.qrCode ?: "")
-        put("infoline1", "2")
-        put("infoline2", "1")
-        put("infoline3", "0")
-        put("qrcodeString", t.qrCode ?: "")
-        put("isChild", 0); put("isStudent", 0); put("isOnline", 0); put("isDiscount", 0)
-    }
-    return payload.toString()
-}
-
 private class RefundItem(val ticket: Ticket) {
     var selected: Boolean = false
     var fee: Double? = null
@@ -557,12 +700,16 @@ private class RefundItem(val ticket: Ticket) {
 @Composable
 private fun RefundDialog(data: OrderDetailData, onDismiss: () -> Unit, onDone: () -> Unit, onError: (String) -> Unit) {
     val scope = rememberCoroutineScope()
-    var tickets by remember { mutableStateOf(data.tickets.map { RefundItem(it) }) }
+    // RefundItem 是可变对象、无 equals,故用引用相等策略:重建列表即触发刷新
+    var tickets by remember {
+        mutableStateOf(data.tickets.map { RefundItem(it) }, referentialEqualityPolicy())
+    }
     var busy by remember { mutableStateOf(false) }
+    var msg by remember { mutableStateOf("") }
 
     fun refreshFee(item: RefundItem) {
         scope.launch {
-            runCatching {
+            resultOf {
                 Repo.bounceFee(data.order.orderId, item.ticket.seatNo ?: "")
             }.onSuccess {
                 item.fee = it
@@ -572,11 +719,16 @@ private fun RefundDialog(data: OrderDetailData, onDismiss: () -> Unit, onDone: (
     }
 
     AlertDialog(
-        onDismissRequest = onDismiss,
+        // 退票进行中禁止关闭:对话框销毁会取消协程,顺序退票会中断成"部分退票"且无提示
+        onDismissRequest = { if (!busy) onDismiss() },
         title = { Text("申请退票") },
         text = {
             Column {
                 Text("退票将按规则收取手续费,请确认。", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                if (msg.isNotEmpty()) {
+                    Spacer(Modifier.height(6.dp))
+                    Text(msg, fontSize = 12.sp, color = MaterialTheme.colorScheme.error)
+                }
                 Spacer(Modifier.height(8.dp))
                 tickets.forEach { item ->
                     Row(verticalAlignment = Alignment.CenterVertically) {
@@ -590,7 +742,7 @@ private fun RefundDialog(data: OrderDetailData, onDismiss: () -> Unit, onDone: (
                         )
                         Column {
                             Text("${item.ticket.name ?: ""}  座位 ${item.ticket.seatNo ?: "-"}")
-                            item.fee?.let { Text("手续费 ¥${"%.2f".format(it)}", fontSize = 12.sp, color = MaterialTheme.colorScheme.error) }
+                            item.fee?.let { Text(String.format(Locale.US, "手续费 ¥%.2f", it), fontSize = 12.sp, color = MaterialTheme.colorScheme.error) }
                         }
                     }
                 }
@@ -602,16 +754,24 @@ private fun RefundDialog(data: OrderDetailData, onDismiss: () -> Unit, onDone: (
                 onClick = {
                     scope.launch {
                         busy = true
+                        msg = ""
+                        var failed: String? = null
                         tickets.filter { it.selected }.forEach { item ->
-                            runCatching { Repo.bounce(data.order.orderId, item.ticket.seatNo ?: "") }
-                                .onFailure { onError(it.message ?: "退票失败") }
+                            resultOf { Repo.bounce(data.order.orderId, item.ticket.seatNo ?: "") }
+                                .onFailure { if (failed == null) failed = it.message ?: "退票失败" }
                         }
                         busy = false
-                        onDone()
+                        if (failed == null) {
+                            onDone()
+                        } else {
+                            // 有失败则保留弹窗并明确提示,不再无条件关闭成"成功"样子
+                            msg = failed ?: "退票失败"
+                            onError(msg)
+                        }
                     }
                 },
             ) { Text(if (busy) "退票中…" else "确认退票") }
         },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
+        dismissButton = { TextButton(enabled = !busy, onClick = onDismiss) { Text("取消") } },
     )
 }

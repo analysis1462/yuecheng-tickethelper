@@ -16,7 +16,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -60,8 +60,6 @@ import com.yuecheng.ticket.ui.common.addDays
 import com.yuecheng.ticket.ui.common.dayDiff
 import com.yuecheng.ticket.ui.common.weekLabel
 import com.yuecheng.ticket.ui.common.yuan
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class, androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 @Composable
@@ -82,17 +80,21 @@ fun ShiftScreen(nav: NavController) {
     var company by remember { mutableStateOf("") }
     var onlyTickets by remember { mutableStateOf(false) }
     var onlyExpress by remember { mutableStateOf(false) }
-
-    val scope = androidx.compose.runtime.rememberCoroutineScope()
+    var retryTick by remember { mutableStateOf(0) }
 
     suspend fun load(d: String) {
         loading = true; error = ""
-        runCatching {
-            Repo.shifts(start?.id ?: "", start?.name ?: "", endName, d)
-        }.onSuccess { shifts = it; loading = false }
-            .onFailure { error = it.message ?: "加载失败"; loading = false }
+        try {
+            shifts = Repo.shifts(start?.id ?: "", start?.name ?: "", endName, d)
+        } catch (ce: kotlinx.coroutines.CancellationException) {
+            throw ce // 切换日期时上一次请求被取消,不算失败
+        } catch (e: Exception) {
+            error = e.message ?: "加载失败"
+        }
+        loading = false
     }
-    LaunchedEffect(Unit) { load(date) }
+    // 日期/重试变化时重新查询,并自动取消上一次请求,避免旧响应覆盖新列表
+    LaunchedEffect(date, retryTick) { load(date) }
 
     // 客户端过滤 + 排序(与 H5 行为一致)
     val shown = remember(shifts, timeRange, station, company, onlyTickets, onlyExpress, sortByTime, timeAsc, priceAsc) {
@@ -136,7 +138,7 @@ fun ShiftScreen(nav: NavController) {
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 TextButton(enabled = date > (FlowState.startIndex?.today ?: date), onClick = {
-                    date = addDays(date, -1); FlowState.pickDate = date; scope.launch { load(date) }
+                    date = addDays(date, -1); FlowState.pickDate = date
                 }) { Text("前一天") }
                 Spacer(Modifier.weight(1f))
                 val diff = dayDiff(date, FlowState.startIndex?.today ?: date)
@@ -146,13 +148,13 @@ fun ShiftScreen(nav: NavController) {
                 )
                 Spacer(Modifier.weight(1f))
                 TextButton(enabled = maxDate == null || date < maxDate, onClick = {
-                    date = addDays(date, 1); FlowState.pickDate = date; scope.launch { load(date) }
+                    date = addDays(date, 1); FlowState.pickDate = date
                 }) { Text("后一天") }
             }
 
             when {
                 loading -> LoadingBox("正在查询班次…")
-                error.isNotEmpty() -> ErrorBox(error) { scope.launch { load(date) } }
+                error.isNotEmpty() -> ErrorBox(error) { retryTick++ }
                 shown.isEmpty() -> {
                     // 醒目的空状态(不再是近似白屏)
                     Column(
@@ -177,10 +179,10 @@ fun ShiftScreen(nav: NavController) {
                         Spacer(Modifier.height(24.dp))
                         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                             androidx.compose.material3.OutlinedButton(onClick = {
-                                date = addDays(date, -1); FlowState.pickDate = date; scope.launch { load(date) }
+                                date = addDays(date, -1); FlowState.pickDate = date
                             }) { Text("查前一天") }
                             androidx.compose.material3.Button(onClick = {
-                                date = addDays(date, 1); FlowState.pickDate = date; scope.launch { load(date) }
+                                date = addDays(date, 1); FlowState.pickDate = date
                             }) { Text("查后一天") }
                         }
                         Spacer(Modifier.height(6.dp))
@@ -194,7 +196,11 @@ fun ShiftScreen(nav: NavController) {
                     contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
-                    items(shown, key = { "${it.stationId}-${it.shiftNum}-${it.sendTime}-${it.portName}" }) { s ->
+                    itemsIndexed(
+                        shown,
+                        // 业务字段可能重复(同班次多公司/多票种),key 追加下标保证唯一
+                        key = { i, s -> "${s.stationId}-${s.shiftNum}-${s.sendTime}-${s.portName}-$i" },
+                    ) { _, s ->
                         ShiftCard(s) {
                             FlowState.resetBooking()
                             FlowState.shift = s
@@ -268,9 +274,6 @@ fun ShiftScreen(nav: NavController) {
         }
     }
 }
-
-@Composable
-private fun IconButtonMock() {}
 
 @Composable
 private fun ShiftCard(s: Shift, onClick: () -> Unit) {

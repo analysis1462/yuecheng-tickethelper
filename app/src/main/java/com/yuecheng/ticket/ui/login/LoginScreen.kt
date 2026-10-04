@@ -48,7 +48,9 @@ import androidx.compose.ui.unit.sp
 import androidx.navigation.NavController
 import com.yuecheng.ticket.data.Api
 import com.yuecheng.ticket.data.Repo
+import com.yuecheng.ticket.data.RegisterRequiredException
 import com.yuecheng.ticket.data.Session
+import com.yuecheng.ticket.data.resultOf
 import com.yuecheng.ticket.ui.common.YcScaffold
 import kotlinx.coroutines.launch
 
@@ -68,7 +70,7 @@ fun LoginScreen(nav: NavController) {
     val scope = rememberCoroutineScope()
 
     suspend fun refreshCaptcha() {
-        runCatching { Api.captchaImage() }.onSuccess {
+        resultOf { Api.captchaImage() }.onSuccess {
             captchaBitmap = BitmapFactory.decodeByteArray(it, 0, it.size)
             captcha = ""; captchaOk = false
         }
@@ -168,7 +170,7 @@ fun LoginScreen(nav: NavController) {
                                 onClick = {
                                     scope.launch {
                                         busy = true; msg = ""
-                                        runCatching { Repo.sendSmsCode(mobile, captcha) }
+                                        resultOf { Repo.sendSmsCode(mobile, captcha) }
                                             .onSuccess { countdown = 60; msg = "验证码已发送,5分钟内有效" }
                                             .onFailure { msg = it.message ?: "发送失败"; refreshCaptcha() }
                                         busy = false
@@ -184,7 +186,7 @@ fun LoginScreen(nav: NavController) {
                         onClick = {
                             scope.launch {
                                 busy = true; msg = ""
-                                runCatching {
+                                resultOf {
                                     val user = if (mode == 0) Repo.loginByPassword(mobile, password)
                                     else Repo.loginBySms(mobile, smsCode)
                                     Session.setLogin(user)
@@ -192,7 +194,7 @@ fun LoginScreen(nav: NavController) {
                                     if (mode == 0) Session.setCredentials(mobile, password)
                                 }.onSuccess { nav.popBackStack() }
                                     .onFailure { e ->
-                                        if (e is com.yuecheng.ticket.data.RegisterRequiredException) {
+                                        if (e is RegisterRequiredException) {
                                             registerToken = e.token
                                             msg = ""
                                         } else {
@@ -228,7 +230,7 @@ fun LoginScreen(nav: NavController) {
             onConfirm = { newPassword ->
                 scope.launch {
                     busy = true; msg = ""
-                    runCatching {
+                    resultOf {
                         // resetPassword 只设置密码、不建立服务端会话(实测 NEEDLOGIN),
                         // 成功后必须用新密码真实登录一次,登录响应的 DATA 即用户信息
                         Repo.resetPassword(mobile, newPassword, token)
