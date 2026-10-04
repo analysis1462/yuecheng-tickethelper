@@ -465,6 +465,7 @@ object Repo {
                 "passengerList" to passengerListJson,
             ),
         )
+        r.guardNeedLogin()
         val code = r.s("CODE") ?: ""
         if (code == "0004") throw ApiException("您有未完成的订单,请到「我的订单」处理")
         if (code != "0000") throw ApiException(r.s("DATA") ?: code.ifEmpty { "下单失败" })
@@ -546,6 +547,7 @@ object Repo {
 
     suspend fun payOrder(orderId: String): String = authed {
         val r = Api.get("/order/payOrder", mapOf("openId" to "", "orderId" to orderId))
+        r.guardNeedLogin()
         val code = r.s("CODE") ?: ""
         if (code != "0000") throw ApiException(r.s("DATA") ?: code.ifEmpty { "获取支付信息失败" })
         r.o("DATA")?.s("payUrl")?.takeIf { it.isNotEmpty() } ?: throw ApiException("未返回支付地址")
@@ -553,11 +555,13 @@ object Repo {
 
     suspend fun cancelOrder(orderId: String) = authed {
         val r = Api.post("/order/cancelOrder", mapOf("orderId" to orderId))
+        r.guardNeedLogin()
         if (r.s("STATUS") != "SUCCESS") throw ApiException(r.s("CODE") ?: "取消失败")
     }
 
     suspend fun bounceFee(orderNo: String, seat: String): Double = authed {
         val r = Api.get("/order/bounceFee", mapOf("orderNo" to orderNo, "seat" to seat, "openId" to ""))
+        r.guardNeedLogin()
         if (r.s("STATUS") != "SUCCESS") throw ApiException(r.s("CODE") ?: "查询退票费失败")
         val v = r.get("DATA")?.takeIf { it.isJsonPrimitive }?.asString ?: "0"
         (v.toDoubleOrNull() ?: 0.0) / 100
@@ -565,6 +569,7 @@ object Repo {
 
     suspend fun bounce(orderNo: String, seat: String) = authed {
         val r = Api.get("/order/bounce", mapOf("orderNo" to orderNo, "seat" to seat, "openId" to ""))
+        r.guardNeedLogin()
         if (r.s("STATUS") != "SUCCESS") throw ApiException(r.s("CODE") ?: "退票失败")
     }
 
@@ -589,12 +594,21 @@ object Repo {
                 "openId" to "",
             ),
         )
+        r.guardNeedLogin()
         val code = r.s("CODE") ?: ""
         if (code != "0000") throw ApiException(r.s("DATA") ?: code.ifEmpty { "改签失败" })
     }
 
     private fun JsonElement.asJsonObjectOrNull(): JsonObject =
         (this as? JsonObject) ?: JsonObject()
+
+    /**
+     * CODE 风格接口的 NEEDLOGIN 守卫:这类接口会话失效时实测返回 {"STATUS":"NEEDLOGIN","CODE":""}
+     * (CODE 为空串),只读 CODE 会绕过 authed 的静默重登,用户只能看到裸的"下单失败"等兜底文案。
+     */
+    private fun JsonObject.guardNeedLogin() {
+        if (s("STATUS") == "NEEDLOGIN") throw NeedLoginException()
+    }
 
     /** 乘客接口的封装判定复用 Api.envelope 同一份实现,这里只把 DATA 收拢为 JsonObject */
     private fun JsonObject.envelopeData(): JsonObject =

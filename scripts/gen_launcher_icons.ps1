@@ -67,7 +67,8 @@ function New-Icon([int]$size, [string]$path) {
     if (Test-Path $path) { Write-Host "OK $path ($size px)" } else { Write-Host "FAIL $path" }
 }
 
-$res = "C:\Users\ADMIN\Desktop\yuecheng\app\src\main\res"
+# repo root = parent of this scripts/ dir (keeps script independent of checkout path)
+$res = Join-Path (Split-Path -Parent $PSScriptRoot) "app\src\main\res"
 New-Icon 48  "$res\mipmap-mdpi\ic_launcher.png"
 New-Icon 72  "$res\mipmap-hdpi\ic_launcher.png"
 New-Icon 96  "$res\mipmap-xhdpi\ic_launcher.png"
