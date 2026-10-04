@@ -40,6 +40,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.navigation.NavController
+import android.content.Intent
+import android.net.Uri
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -132,22 +134,27 @@ fun ProfileScreen(nav: NavController) {
                 }
             }
 
-            // 底部:项目地址(GitHub,地址待补充)
+            // 底部:项目地址(点击用浏览器打开仓库主页)
             Spacer(Modifier.weight(1f))
+            val repoUrl = "https://github.com/analysis1462/yuecheng-tickethelper"
             Row(
-                Modifier.fillMaxWidth().padding(vertical = 12.dp),
+                Modifier.fillMaxWidth().clickable {
+                    runCatching {
+                        nav.context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(repoUrl)))
+                    }
+                }.padding(vertical = 12.dp),
                 horizontalArrangement = Arrangement.Center,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Icon(
                     Icons.Default.Code, null,
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    tint = MaterialTheme.colorScheme.primary,
                     modifier = Modifier.size(16.dp),
                 )
                 Spacer(Modifier.width(6.dp))
                 Column {
-                    Text("项目地址:GitHub", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Text("开源地址待补充", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
+                    Text("项目地址", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(repoUrl.removePrefix("https://"), fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
                 }
             }
         }
