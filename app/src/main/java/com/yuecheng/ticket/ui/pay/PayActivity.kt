@@ -6,6 +6,7 @@ import android.net.Uri
 import android.os.Bundle
 import android.view.ViewGroup
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -30,6 +31,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import java.io.ByteArrayInputStream
 import com.yuecheng.ticket.data.ThemePrefs
 import com.yuecheng.ticket.ui.theme.YcTheme
 import com.yuecheng.ticket.ui.theme.applyWindowBackground
@@ -38,7 +40,8 @@ import com.yuecheng.ticket.ui.theme.applyWindowBackground
  * 支付容器:加载官方支付网关返回的 payUrl。
  * 拦截 alipay:// / alipays:// / weixin:// 等scheme跳转到原生支付宝/微信完成支付;
  * intent:// 协议按 Chrome 规则解析降级;
- * payUrl 统一升级为 HTTPS 加载(网关已实测支持);顶层导航离开网关主机时先弹用户确认,防劫持页导去钓鱼站。
+ * 顶层导航一律 HTTPS(网关与支付宝等收银台均已实测支持;服务端 302 在 shouldInterceptRequest 兜底重定向);
+ * https 跨站跳转需用户确认,防劫持页导去钓鱼站。
  */
 class PayActivity : ComponentActivity() {
 
@@ -99,6 +102,24 @@ class PayActivity : ComponentActivity() {
                                     @Deprecated("Deprecated in Java")
                                     override fun shouldOverrideUrlLoading(view: WebView, url: String): Boolean =
                                         handleUrl(view, url, true)
+
+                                    override fun shouldInterceptRequest(
+                                        view: WebView,
+                                        request: WebResourceRequest,
+                                    ): WebResourceResponse? {
+                                        // 服务端 302 重定向不经过 shouldOverrideUrlLoading:
+                                        // 顶层 http 请求在此返回 307,把支付流程强制引到 https
+                                        if (request.isForMainFrame &&
+                                            request.url.scheme?.equals("http", ignoreCase = true) == true
+                                        ) {
+                                            return WebResourceResponse(
+                                                "text/html", "utf-8", 307, "Temporary Redirect",
+                                                mapOf("Location" to request.url.buildUpon().scheme("https").toString()),
+                                                ByteArrayInputStream(ByteArray(0)),
+                                            )
+                                        }
+                                        return null
+                                    }
                                 }
                                 loadUrl(url)
                             }.also { webView = it }
@@ -118,12 +139,10 @@ class PayActivity : ComponentActivity() {
      * 返回 true 表示已拦截。已知支付 scheme 放行到外部 App,未知 scheme 一律拦截;
      * 顶层导航跳往支付网关以外的站点时先弹用户确认,确认后才加载(子框架不受影响)。
      */
-    /** 网关已支持 HTTPS:把本站 http://pay.xintuyun.cn 统一升级为 https,其余 URL 原样返回 */
+    /** 支付 WebView 顶层导航一律走 HTTPS:网关/支付宝/微信收银台均已实测支持,个别站升级失败会显式报错而非回落明文 */
     private fun upgradePayUrl(url: String): String {
         val u = runCatching { Uri.parse(url) }.getOrNull() ?: return url
-        return if (u.scheme?.lowercase() == "http" && u.host?.lowercase() == "pay.xintuyun.cn")
-            u.buildUpon().scheme("https").toString()
-        else url
+        return if (u.scheme?.lowercase() == "http") u.buildUpon().scheme("https").toString() else url
     }
 
     private fun handleUrl(view: WebView, url: String, mainFrame: Boolean): Boolean {
@@ -131,14 +150,14 @@ class PayActivity : ComponentActivity() {
         return when (uri.scheme?.lowercase()) {
             null, "http", "https" -> {
                 when {
-                    mainFrame && payHost != null && !uri.host.equals(payHost, ignoreCase = true) -> {
-                        pendingCrossSiteUrl = url
+                    // 顶层 http 一律升级为 https(点击/JS 跳转;服务端 302 由 shouldInterceptRequest 兜底)
+                    mainFrame && uri.scheme?.lowercase() == "http" -> {
+                        view.loadUrl(upgradePayUrl(url))
                         true
                     }
-                    // 同站 http 顶层跳转(如网关 302 回 http)也升级为 https,保持全程加密
-                    mainFrame && payHost != null && uri.host.equals(payHost, ignoreCase = true)
-                        && uri.scheme?.lowercase() == "http" -> {
-                        view.loadUrl(upgradePayUrl(url))
+                    // https 跨站跳转需用户确认(收银台/回跳页常在此列),防劫持页导去钓鱼站
+                    mainFrame && payHost != null && !uri.host.equals(payHost, ignoreCase = true) -> {
+                        pendingCrossSiteUrl = url
                         true
                     }
                     else -> false // WebView 自己处理
